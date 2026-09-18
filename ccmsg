@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""ccmsg — send a message to another agent session by name.
+
+    ccmsg --list
+    ccmsg fw2 "the full build finished; all tests pass"
+    ccmsg codex:t42 "picked up your handoff, starting the replay"
+    ccmsg whoami                       which session am I
+    ccmsg forward @app2                forward my last answer to @app2
+    ccmsg forward @app2 --dry-run      show what would be sent
+
+Claude and codex sessions are different animals — one is a tmux pane, the
+other a dtach socket — and until now only Claude sessions could be addressed,
+and only by another Claude. This reaches both, from either, by name.
+
+How each half is written to:
+
+  claude   tmux send-keys into the session's pane, then Enter. Same path the
+           dashboard's command bar uses.
+  codex    a MSG_PUSH packet on the dtach socket. dtach's protocol is
+           type(1) + len(1) + buf(8), and the master writes buf[:len]
+           straight to the pty without the sender becoming a client — so
+           nothing attaches and nothing is resized. Attaching would have
+           resized the session for whoever is watching it.
+
+Deliberately no HTTP and no dependency on roost running: this is the floor
+that the /api/msg route is built on, and it works when the dashboard does
+not.
+"""
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DTACH = Path.home() / ".dtach"
+
+def _suffix():
+    """The dashboard's display suffix. A session's roost name is the name on
+    its card — @app2, not @app — and for a session still held by tmux that
+    means the tmux name plus this. Sessions under dtach already carry it in
+    their socket name, which is why only these two ever disagreed."""
+    try:
+        cfg = json.loads((Path(__file__).resolve().parent / "config.json").read_text())
+        return cfg.get("display_suffix", "") or ""
+    except (OSError, ValueError):
+        return ""
+
+SUFFIX = _suffix()
+MSG_PUSH = 0
+PUSH_MAX = 8                      # sizeof(struct winsize), the union's width
+
+
+def tmux(*args):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+# What an agent looks like from outside. A message ends in Enter, so one that
+# lands in a plain shell is a command: only a session whose program is an
+# agent is ever a target, whatever its definition or name says.
+AGENT_COMMS = {"claude", "codex", "node"}
+
+
+def tmux_sessions():
+    """tmux sessions whose foreground program is an agent right now."""
+    rc, out = tmux("list-sessions", "-F", "#{session_name}\t#{pane_pid}")
+    if rc:
+        return []
+    live = []
+    for line in out.splitlines():
+        name, _, pid = line.partition("\t")
+        if name and pid.isdigit() and _foreground_is_agent(int(pid)):
+            live.append(name)
+    return live
+
+
+def _record(path):
+    """A ~/.claude/sessions record with sane field types, or None."""
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    for k in ("cwd", "tmux", "name", "sessionId"):
+        if k in d and not isinstance(d[k], str):
+            del d[k]
+    if not isinstance(d.get("pid"), int) or isinstance(d.get("pid"), bool):
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_-]*", d.get("sessionId", "")):
+        d.pop("sessionId", None)
+    try:
+        os.stat("/proc/%d" % d["pid"])
+    except OSError:
+        return None                    # a dead session's record says nothing
+    return d
+
+
+SHELLS = {"bash", "sh", "dash", "zsh", "fish", "ksh", "tcsh", "csh"}
+
+
+def _proc(pid):
+    """(comm, argv, ppid, tpgid) for a pid, or None."""
+    try:
+        stat = Path("/proc/%s/stat" % pid).read_text()
+        argv = Path("/proc/%s/cmdline" % pid).read_bytes().split(b"\0")
+    except OSError:
+        return None
+    comm = stat[stat.index("(") + 1:stat.rindex(")")]
+    rest = stat[stat.rindex(")") + 2:].split()
+    return comm, [a.decode("utf-8", "replace") for a in argv if a], rest[1], rest[5]
+
+
+def _is_agent(comm, argv):
+    c = comm.lower()
+    if c in ("claude", "codex"):
+        return True
+    # node is only an agent when it is running one
+    return c == "node" and any(re.search(r"claude|codex|anthropic", a)
+                               for a in argv[1:])
+
+
+def _runs_a_command(argv):
+    """A shell started with -c (bash -lc "..."), and not interactive."""
+    flags = [a[1:] for a in argv[1:] if a.startswith("-") and not a.startswith("--")]
+    return any("c" in f for f in flags) and not any("i" in f for f in flags)
+
+
+def _foreground_is_agent(shell_pid):
+    """tmux: the process that owns the pane's terminal must be an agent."""
+    me = _proc(shell_pid)
+    if not me or not me[3].lstrip("-").isdigit() or int(me[3]) <= 0:
+        return False
+    fg = _proc(me[3])
+    return bool(fg) and _is_agent(fg[0], fg[1])
+
+
+def _agent_under(sock):
+    """dtach: the session is an agent, and nothing but an agent.
+
+    Below the `dtach -n <sock>` master there may be only non-interactive
+    shells (the `bash -lc` that runs the definition) and the agent itself;
+    what the agent runs is its own business. Any other process -- an
+    interactive shell left behind after the agent exited, a REPL, a
+    background job -- means the pty may be read by something that would
+    execute a message, so the session is not a target."""
+    sock = str(sock)
+    kids, master = {}, None
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        info = _proc(d.name)
+        if not info:
+            continue
+        comm, argv, ppid, _ = info
+        kids.setdefault(ppid, []).append((d.name, comm, argv))
+        if len(argv) > 2 and argv[0].endswith("dtach") and argv[1] == "-n" \
+           and argv[2] == sock:
+            master = d.name
+    if not master:
+        return False
+    found, todo = False, [master]
+    while todo:
+        for pid, comm, argv in kids.get(todo.pop(), []):
+            if _is_agent(comm, argv):
+                found = True               # its subtree is its own
+            elif comm.lower() in SHELLS and _runs_a_command(argv):
+                todo.append(pid)
+            else:
+                return False
+    return found
+
+
+def dtach_sessions():
+    """Live dtach sessions, each labelled by what it actually runs.
+
+    Both kinds live here now: codex was always under dtach, and Claude
+    sessions were moved to it. The .cmd says which — a command that launches
+    claude is a Claude session, whatever the socket is called. Without this
+    every migrated session was announced as codex, and "claude:<name>" would
+    not resolve to the thing it names."""
+    out = []
+    try:
+        files = sorted(DTACH.glob("*.cmd"))
+    except OSError:
+        return out
+    for f in files:
+        n = f.stem
+        if not (DTACH / n).is_socket():
+            continue
+        try:
+            cmd = f.read_text()
+        except OSError:
+            cmd = ""
+        if "tmux new-session" in cmd:
+            continue                  # a terminal attached to a tmux session
+        if re.search(r"(^|&&|;|\|\|)\s*claude\b", cmd):
+            kind = "claude"
+        elif re.search(r"(^|&&|;|\|\|)\s*codex\b", cmd):
+            kind = "codex"
+        else:
+            continue                  # not an agent: a message would be a command
+        if not _agent_under(DTACH / n):
+            continue                  # the agent has exited; a shell may be left
+        out.append((kind, n, _alias_for(cmd) if kind == "claude" else "", "dtach"))
+    return out
+
+def _alias_for(cmd):
+    """The Claude session name for a launcher, via the folder it cd's to."""
+    m = re.search(r"cd\s+(\S+)", cmd)
+    if not m:
+        return ""
+    try:
+        want = str(Path(m.group(1).replace("~", str(Path.home()))).resolve())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+    for rec in (Path.home() / ".claude" / "sessions").glob("*.json"):
+        d = _record(rec)
+        if d is None:
+            continue
+        if (d.get("cwd") or "") == want:
+            try:
+                os.stat("/proc/%s" % d.get("pid"))
+            except OSError:
+                continue
+            return d.get("name") or ""
+    return ""
+
+
+def claude_names():
+    """tmux session -> the Claude session name running in it, when there is
+    one. Both are accepted as targets: the dashboard shows one, `claude`
+    itself shows the other."""
+    out = {}
+    for rec in (Path.home() / ".claude" / "sessions").glob("*.json"):
+        d = _record(rec)
+        if d is None:
+            continue
+        pane = (d.get("tmux") or "").split(":")[0]
+        if pane:
+            out[pane] = d.get("name") or ""
+    return out
+
+
+def targets():
+    """[(kind, name, alias, transport)] — everything addressable now."""
+    live = set(tmux_sessions())
+    names = claude_names()
+    # Four fields, and the last one is the point: what a session RUNS and
+    # where it LIVES are now different questions. A migrated Claude session
+    # runs claude but lives in a dtach socket, and sending tmux keys at it
+    # reaches nothing.
+    out = [("claude", s + SUFFIX, names.get(s, ""), "tmux") for s in sorted(live)
+           if not s.endswith("-web")]      # a grouped session is not a target
+    out += dtach_sessions()
+    return out
+
+
+def resolve(want):
+    """A name, optionally kind-prefixed, to exactly one target.
+
+    A bare name can be ambiguous — there is both a Claude session and a codex
+    terminal called fw — and guessing which one a message was meant for is
+    not a thing to be casual about, so it is refused."""
+    kind = ""
+    if ":" in want and want.split(":", 1)[0] in ("claude", "codex"):
+        kind, want = want.split(":", 1)
+    hits = [t for t in targets()
+            if (not kind or t[0] == kind)
+            and (t[1] == want or t[2] == want
+                 or (t[3] == "tmux" and SUFFIX and t[1] == want + SUFFIX))]
+    if not hits:
+        return None, "no session called %r" % want
+    if len(hits) > 1:
+        return None, ("%r is ambiguous: %s — prefix it, e.g. %s"
+                      % (want, ", ".join("%s:%s" % (h[0], h[1]) for h in hits),
+                         "%s:%s" % (hits[0][0], hits[0][1])))
+    return hits[0], ""
+
+
+def send_tmux(pane, text):
+    if SUFFIX and pane.endswith(SUFFIX) and not tmux("has-session", "-t",
+                                                     "=" + pane)[0] == 0:
+        pane = pane[:-len(SUFFIX)]      # @app2 is the card; app is the session
+    tmux("send-keys", "-t", pane + ":", "-l", text)
+    time.sleep(0.4)               # let a slash-command menu settle first
+    tmux("send-keys", "-t", pane + ":", "Enter")
+
+
+def send_dtach(name, text):
+    sock = DTACH / name
+    data = (text + "\r").encode()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(sock))
+        for i in range(0, len(data), PUSH_MAX):
+            chunk = data[i:i + PUSH_MAX]
+            s.sendall(bytes([MSG_PUSH, len(chunk)]) + chunk.ljust(PUSH_MAX, b"\0"))
+    finally:
+        s.close()
+
+
+def send(want, text):
+    """(ok, detail). One line only: a newline mid-message would submit it
+    early, which for an agent prompt means sending half a thought.
+
+    Every other control character goes too. The text is often another
+    agent's answer, which may quote anything it read, and on the receiving
+    end it is keystrokes: a ^C or an escape sequence in it would act on the
+    target's terminal rather than be read by it."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text).strip()
+    if not text:
+        return False, "empty message"
+    hit, err = resolve(want)
+    if not hit:
+        return False, err
+    kind, name, _, transport = hit
+    try:
+        (send_tmux if transport == "tmux" else send_dtach)(name, text)
+    except OSError as e:
+        return False, "%s: %s" % (name, e)
+    return True, "sent to %s:%s (%s)" % (kind, name, transport)
+
+
+
+# --------------------------------------------------------------- handover
+# A session's roost name is the label on its card: @fw2, @t42, @t7. It is
+# how one agent addresses another, and how a handed-over result says where it
+# came from.
+
+CLAUDE_SESSIONS = Path.home() / ".claude" / "sessions"
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+TAIL = 4 << 20                     # how much of a transcript to read from the end
+
+
+def cmd_of(name):
+    try:
+        return (DTACH / (name + ".cmd")).read_text()
+    except OSError:
+        return ""
+
+
+def cwd_of(name, kind):
+    """The folder a session works in."""
+    if kind == "claude":
+        for rec in CLAUDE_SESSIONS.glob("*.json"):
+            d = _record(rec)
+            if d is None:
+                continue
+            pane = (d.get("tmux") or "").split(":")[0]
+            if pane == name or (SUFFIX and pane + SUFFIX == name):
+                return d.get("cwd") or ""
+    m = re.search(r"cd\s+(\S+)", cmd_of(name))
+    if m:
+        try:
+            return str(Path(m.group(1).replace("~", str(Path.home()))).resolve())
+        except (OSError, ValueError, RuntimeError):
+            return ""
+    return ""
+
+
+def whoami():
+    """This session's roost name, or "".
+
+    ROOST_NAME is exported by the launcher, so a session started since that
+    landed simply knows -- as does one still exporting the CCRC_NAME this
+    was called before the rename, since a running session cannot be told to
+    export something else. Older ones are matched on the folder they run in,
+    narrowed by which assistant is asking — a claude and a codex session can
+    share a folder, and around here several do."""
+    env = (os.environ.get("ROOST_NAME")
+           or os.environ.get("CCRC_NAME")     # named before the rename
+           or "").strip()
+    if env:
+        return env
+    kind = "claude" if os.environ.get("CLAUDECODE") or \
+        os.environ.get("CLAUDE_CODE_SESSION_ID") else "codex"
+    here = os.getcwd()
+    for k, name, alias, _t in targets():
+        if k == kind and cwd_of(name, k) == here:
+            return name
+    return ""
+
+
+def _d(x):
+    return x if isinstance(x, dict) else {}
+
+
+def _tolerant(fn):
+    """A transcript is the agent's file; a line of the wrong shape means
+    "nothing to report", not a crash."""
+    def inner(*a):
+        try:
+            return fn(*a)
+        except (TypeError, AttributeError, KeyError, IndexError):
+            return ""
+    return inner
+
+
+@_tolerant
+def _last_assistant_claude(path):
+    for line in _tail_lines(path):
+        try:
+            o = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(o, dict):
+            continue
+        if o.get("type") != "assistant":
+            continue
+        c = _d(o.get("message")).get("content")
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+        for b in reversed(c or []):
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                return b["text"].strip()
+    return ""
+
+
+@_tolerant
+def _last_assistant_codex(path):
+    for line in _tail_lines(path):
+        try:
+            o = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(o, dict):
+            continue
+        if o.get("type") != "response_item":
+            continue
+        pl = _d(o.get("payload"))
+        if pl.get("type") == "message" and pl.get("role") == "assistant":
+            parts = []
+            for b in pl.get("content") or []:
+                if isinstance(b, dict) and b.get("text"):
+                    parts.append(b["text"])
+            if "".join(parts).strip():
+                return "".join(parts).strip()
+    return ""
+
+
+def _tail_lines(path):
+    """Lines from the end, newest first. A transcript runs to hundreds of
+    megabytes and the answer is always at the end."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > TAIL:
+                fh.seek(size - TAIL)
+                fh.readline()
+            data = fh.read()
+    except OSError:
+        return []
+    return reversed(data.decode("utf-8", "replace").splitlines())
+
+
+def transcript_of(name, kind):
+    """The file a session is writing its conversation to."""
+    if kind == "claude":
+        for rec in CLAUDE_SESSIONS.glob("*.json"):
+            d = _record(rec)
+            if d is None:
+                continue
+            if (d.get("cwd") or "") != cwd_of(name, kind):
+                continue
+            try:
+                os.stat("/proc/%s" % d.get("pid"))
+            except OSError:
+                continue
+            hits = list(CLAUDE_PROJECTS.glob("*/" + (d.get("sessionId") or "") + ".jsonl"))
+            if hits:
+                return hits[0]
+        return None
+    want = cwd_of(name, kind)
+    best = None
+    try:
+        for f in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
+            if best and f.stat().st_mtime <= best[0]:
+                continue
+            head = ""
+            try:
+                with f.open("r", errors="replace") as fh:
+                    head = "".join(fh.readline() for _ in range(4))
+            except OSError:
+                continue
+            if want and ('"cwd":"%s"' % want in head.replace(" ", "")
+                         or '"cwd": "%s"' % want in head):
+                best = (f.stat().st_mtime, f)
+    except OSError:
+        pass
+    return best[1] if best else None
+
+
+def last_said(name, kind):
+    f = transcript_of(name, kind)
+    if not f:
+        return ""
+    return (_last_assistant_claude(f) if kind == "claude"
+            else _last_assistant_codex(f))
+
+
+# Email words, because this is email: forward, auto-forward, reply. The old
+# marker is still recognised so anything already sitting in a session is not
+# suddenly unrecognisable.
+FORWARD_MARK = "[forwarded by @"
+OLD_MARK = "[handed over by @"
+
+
+@_tolerant
+def _last_user_claude(path):
+    for line in _tail_lines(path):
+        try:
+            o = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(o, dict):
+            continue
+        if o.get("type") != "user":
+            continue
+        c = _d(o.get("message")).get("content")
+        if isinstance(c, str) and c.strip():
+            return c.strip()
+        for b in reversed(c or []):
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                return b["text"].strip()
+    return ""
+
+
+@_tolerant
+def _last_user_codex(path):
+    for line in _tail_lines(path):
+        try:
+            o = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(o, dict):
+            continue
+        pl = _d(o.get("payload"))
+        if o.get("type") == "response_item" and pl.get("type") == "message" \
+                and pl.get("role") == "user":
+            parts = [b.get("text", "") for b in (pl.get("content") or [])
+                     if isinstance(b, dict)]
+            if "".join(parts).strip():
+                return "".join(parts).strip()
+    return ""
+
+
+def arrived_by_forward(name, kind):
+    """Was the last thing said to this session itself a forward?
+
+    One hop, and no chains. Two agents that may each pass work on can pass it
+    back, and every lap costs tokens in sessions nobody is watching. A hop
+    counter would bound that; refusing the second hop removes it."""
+    f = transcript_of(name, kind)
+    if not f:
+        return False
+    last = (_last_user_claude(f) if kind == "claude" else _last_user_codex(f))
+    return last.lstrip().startswith((FORWARD_MARK, OLD_MARK))
+
+
+def forward(target, source="", dry=False, force=False):
+    """Send this session's last answer to another, saying where it came from.
+
+    The text is what the source actually said, not a summary of it: a summary
+    is a second chance to lose the detail the handover exists to carry."""
+    src = source or whoami()
+    if not src:
+        return False, ("cannot tell which session this is — pass --from @name, "
+                       "or restart the session so it exports ROOST_NAME")
+    hit, err = resolve(src.lstrip("@"))
+    if not hit:
+        return False, "source: " + err
+    if not force and arrived_by_forward(hit[1], hit[0]):
+        return False, ("@%s is working on something that was itself forwarded "
+                       "to it — one hop only, so this would start a chain. "
+                       "Pass --force if that is really what you want." % hit[1])
+    text = last_said(hit[1], hit[0])
+    if not text:
+        return False, "%s has not said anything to hand over" % src
+    note = FORWARD_MARK + "%s] " % hit[1]
+    if dry:
+        dst, derr = resolve(target.lstrip("@"))
+        if not dst:
+            return False, "target: " + derr
+        return True, ("would send to @%s (%s via %s):\n%s"
+                      % (dst[1], dst[0], dst[3], note + text))
+    return send(target.lstrip("@"), note + text)
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if argv[1] in ("-l", "--list"):
+        me = whoami()
+        for kind, name, alias, transport in targets():
+            print("  %-16s %-7s %-8s %s%s"
+                  % ("@" + name, kind, transport, alias,
+                     "   <- you" if name == me else ""))
+        return 0
+    if argv[1] == "whoami":
+        me = whoami()
+        print("@" + me if me else "unknown — restart the session to export ROOST_NAME")
+        return 0 if me else 1
+    if argv[1] in ("forward", "fw", "handover"):
+        if len(argv) < 3:
+            print("usage: ccmsg forward @target [--from @name]", file=sys.stderr)
+            return 2
+        src = ""
+        if "--from" in argv:
+            i = argv.index("--from")
+            src = argv[i + 1] if len(argv) > i + 1 else ""
+        ok, detail = forward(argv[2], src, "--dry-run" in argv,
+                             "--force" in argv)
+        print(detail, file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 1
+    if len(argv) < 3:
+        print("usage: ccmsg <session> <message>", file=sys.stderr)
+        return 2
+    ok, detail = send(argv[1], " ".join(argv[2:]))
+    print(detail, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

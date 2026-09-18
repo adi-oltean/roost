@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# The live config: the dashboard writes card_order and favorites into it, and
+# one machine's folder list is not another's. Start from config.example.json.
+config.json
+
+# Scratch scripts and their output (tmp/ro, tmp/rw, tmp/shots).
+tmp/
+
+# The public repo, cloned here and tracked by its own git.
+/roost/

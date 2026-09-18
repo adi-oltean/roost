@@ -1,0 +1,39 @@
+{
+  "_readme": "Copy to config.json and edit. server.py does that for you on first run. The live config.json is not tracked: the dashboard writes card_order and favorites back to it as you drag and pin.",
+
+  "_socket": "Unix sockets, not ports: loopback TCP is reachable by other accounts and, under WSL2, by every Windows process. tailscale serve points at the first one.",
+  "socket": "~/.roost/roost.sock",
+  "ttyd_socket": "~/.dtach/ttyd.sock",
+  "src_dir": "~/src",
+
+  "_allow_logins": "Tailnet logins allowed to use the dashboard AT ALL. The server refuses to start with this empty; replace the placeholder with your own login.",
+  "allow_logins": ["you@example.com"],
+
+  "_hosts": "Optional. Host names to accept besides loopback and *.ts.net; anything else is refused (DNS rebinding).",
+  "hosts": [],
+
+  "_display_suffix": "Per-machine postfix on card labels and /rc names, so pages from two machines are distinguishable. Folder names are never suffixed; the card label and the dtach socket carry it.",
+  "display_suffix": "",
+
+  "_folders": "One Claude Code session per entry. A bare name resolves to src_dir/<name>. Use {path, name} for a repo nested inside another workspace, or when the card should not be called after the directory.",
+  "folders": [
+    "myrepo",
+    { "path": "workspace/nested/long-directory-name", "name": "short" }
+  ],
+
+  "_fallback_model": "Model for a session with no conversation to resume. Resumed sessions keep whatever they were on.",
+  "fallback_model": "opus",
+
+  "_clone": "If a folder is missing, Start clones it first: clone_urls[name] if present, else clone_base/<name>.git",
+  "clone_base": "https://github.com/your-org",
+  "clone_urls": {
+    "myrepo": "https://github.com/your-org/myrepo.git"
+  },
+
+  "_file_roots": "Optional. What the file viewer may serve, on top of each session's own folder. Default: src_dir and /tmp. $HOME and ~/.roost/pasted are always added.",
+  "file_roots": ["~/src", "/tmp"],
+
+  "_written_by_the_page": "card_order and favorites appear here on their own once you drag or pin a card. Do not hand-edit them while the server is running.",
+
+  "_codex": "Codex terminals are NOT configured here. They are ~/.dtach/<name>.cmd files: ./term.sh <name> 'cd ~/src/<repo> && codex'"
+}
