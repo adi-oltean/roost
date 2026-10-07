@@ -21,10 +21,20 @@ set -uo pipefail
 umask 077
 cd "$(dirname "$0")"
 
+# Where the live config is. A roost-config directory beside this script wins
+# when it exists, which is what lets the config be a private repository of
+# its own rather than a gitignored file nothing has a copy of.
+# ROOST_CONFIG_DIR overrides it. Exported because the python3 programs below
+# are single-quoted, where a shell variable would not expand.
+ROOST_CFG=config.json
+[ -d roost-config ] && ROOST_CFG=roost-config/config.json
+[ -n "${ROOST_CONFIG_DIR:-}" ] && ROOST_CFG="$ROOST_CONFIG_DIR/config.json"
+export ROOST_CFG
+
 TSOCK="${ROOST_TTYD_SOCK:-}"                        # ttyd itself: a Unix socket
 if [ -z "$TSOCK" ]; then
   TSOCK=$(python3 -c 'import json,os
-try: cfg = json.load(open("config.json"))
+try: cfg = json.load(open(os.environ["ROOST_CFG"]))
 except OSError: cfg = {}
 print(os.path.expanduser(cfg.get("ttyd_socket", "~/.dtach/ttyd.sock")))' 2>/dev/null)
 fi

@@ -240,10 +240,26 @@ config.json created from config.example.json -- edit it
 (allow_logins and folders at least), then restart
 ```
 
-It is untracked for two reasons: one machine's folder list is not another's,
-and **the dashboard writes to it** — `card_order` every time you drag a card,
-`favorites` every time you pin one. A tracked file that rewrites itself under
-you is a permanent dirty diff.
+It is untracked *here* for two reasons: one machine's folder list is not
+another's, and **the dashboard writes to it** — `card_order` every time you
+drag a card, `favorites` every time you pin one. A tracked file that
+rewrites itself under you is a permanent dirty diff.
+
+Untracked is not the same as unbacked, though, and the difference matters:
+a gitignored file never appears in `git status`, so nothing ever prompts
+about it, and if the disk goes so does the folder list, the login allow-list
+and the card order.
+
+So give it a repository of its own. Create a `roost-config/` directory beside
+the code and everything — the server, `restart.sh`, `term.sh`,
+`fork-session.sh`, `ccmsg` and `onboarding.sh` — reads and writes
+`roost-config/config.json` instead; `ROOST_CONFIG_DIR` overrides it, and a
+clone with neither falls back to the file beside the code. Make that
+directory a **private** repository: it names your folders and your login.
+
+A directory, not a symlinked file: the config is replaced by rename on every
+write, so a symlink would be destroyed the first time you dragged a card,
+leaving the versioned copy quietly stale.
 
 Edit at minimum:
 

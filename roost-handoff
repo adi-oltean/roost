@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Handoffs that can be ordered, and that say whose turn it is.
+
+A handoff written as one file, edited in place each time, has no version:
+whatever number its title claims is a separate act from changing the
+content, and that act is the one people skip. Real examples from this
+machine -- a file titled "v15" containing v16, one titled "Handoff v1"
+mentioning v8, and one rewritten fourteen times where the round number
+survives only in commit messages nobody reads while working.
+
+So a handoff is never edited. Each is a new file whose name carries
+everything needed to order it and route it:
+
+    handoffs/0007-20260920T1146Z-codex-to-claude.md
+             ^^^^ ^^^^^^^^^^^^^^ ^^^^^    ^^^^^^
+             seq  when (UTC)     from     to
+
+The sequence answers "which is the last one" without opening anything, the
+timestamp survives being copied between machines, and the direction answers
+"whose turn is it" -- it is the `to` of the highest number.
+
+    roost-handoff new --to claude          write one, print its path
+    roost-handoff latest                   the newest, and whose turn
+    roost-handoff list                     all of them, newest first
+    roost-handoff --test                   check the rules against cases
+
+The number is allocated with O_EXCL, so two sessions handing off in the
+same second cannot take the same one: the loser sees the file exists and
+takes the next.
+"""
+import argparse
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+DIRNAME = "handoffs"
+NAME_RE = re.compile(
+    r"^(?P<seq>\d{4})-(?P<when>\d{8}T\d{4}Z)-(?P<frm>[A-Za-z0-9_-]+)"
+    r"-to-(?P<to>[A-Za-z0-9_-]+)\.md$")
+WHO_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def find_dir(start=None, create=False):
+    """The nearest handoffs directory, walking up from here.
+
+    Walking up rather than demanding a path means a session deep in a
+    worktree hands off to the same place as one at the repository root,
+    which is the only way the sequence stays a single sequence."""
+    here = Path(start or Path.cwd()).resolve()
+    for d in [here] + list(here.parents):
+        cand = d / DIRNAME
+        if cand.is_dir():
+            return cand
+        if (d / ".git").exists():
+            break                      # do not escape the repository
+    if create:
+        target = here / DIRNAME
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    return None
+
+
+def entries(d):
+    """Every handoff in the directory, oldest first, malformed ones last.
+
+    A file that does not parse is reported rather than skipped: a handoff
+    nobody can order is exactly the problem this replaces, and hiding it
+    would recreate it."""
+    good, bad = [], []
+    for p in sorted(d.iterdir()):
+        if not p.is_file() or not p.name.endswith(".md"):
+            continue
+        m = NAME_RE.match(p.name)
+        if m:
+            good.append((int(m.group("seq")), m.group("when"),
+                         m.group("frm"), m.group("to"), p))
+        else:
+            bad.append(p)
+    good.sort()
+    return good, bad
+
+
+def stamp(t=None):
+    return time.strftime("%Y%m%dT%H%MZ", time.gmtime(t))
+
+
+def pretty(when):
+    """20260920T1146Z -> 2026-09-20 11:46 UTC"""
+    return "%s-%s-%s %s:%s UTC" % (when[0:4], when[4:6], when[6:8],
+                                   when[9:11], when[11:13])
+
+
+HEADER = """# Handoff {seq:04d} — {frm} → {to}
+
+Written {pretty}.
+{prev}
+This file is never edited. The next handoff is a new file with the next
+number; that is what makes "which is the last one" answerable by looking.
+
+## What was done
+
+## What is left
+
+## What {to} should do next
+"""
+
+
+def cmd_new(args):
+    d = find_dir(create=True)
+    frm = args.frm or os.environ.get("ROOST_NAME") or ""
+    if not frm:
+        print("who is handing off? pass --from, or set ROOST_NAME",
+              file=sys.stderr)
+        return 2
+    for who, label in ((frm, "--from"), (args.to, "--to")):
+        if not WHO_RE.match(who or ""):
+            print("%s must be [A-Za-z0-9_-]: %r" % (label, who),
+                  file=sys.stderr)
+            return 2
+    if frm == args.to:
+        print("a handoff goes to somebody else", file=sys.stderr)
+        return 2
+
+    good, _ = entries(d)
+    prev = good[-1] if good else None
+    prev_line = ("Previous: %04d (%s → %s).\n" % (prev[0], prev[2], prev[3])
+                 if prev else "The first of this series.\n")
+    seq = (prev[0] + 1) if prev else 1
+    when = stamp()
+
+    # Two sessions handing off in the same moment must not take one number.
+    # O_EXCL decides it: whoever creates the file owns that number, and the
+    # other one walks on. Bounded, because a loop that cannot end is worse
+    # than a collision.
+    for _ in range(200):
+        p = d / ("%04d-%s-%s-to-%s.md" % (seq, when, frm, args.to))
+        try:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            seq += 1
+            continue
+        with os.fdopen(fd, "w") as fh:
+            fh.write(HEADER.format(seq=seq, frm=frm, to=args.to,
+                                   pretty=pretty(when), prev=prev_line))
+            if args.body:
+                fh.write("\n" + args.body.rstrip() + "\n")
+        print(p)
+        return 0
+    print("could not allocate a number after 200 tries", file=sys.stderr)
+    return 1
+
+
+def _report(d, good, bad, verbose):
+    if not good and not bad:
+        print("no handoffs in %s" % d)
+        return 0
+    if good:
+        seq, when, frm, to, p = good[-1]
+        print("latest   %04d  %s  %s → %s" % (seq, pretty(when), frm, to))
+        print("whose turn: %s" % to)
+        print("file     %s" % p)
+    if verbose and len(good) > 1:
+        print("\nearlier, newest first:")
+        for seq, when, frm, to, p in reversed(good[:-1]):
+            print("   %04d  %s  %-10s → %-10s" % (seq, pretty(when), frm, to))
+    if bad:
+        print("\nnot named as handoffs (cannot be ordered):")
+        for p in bad:
+            print("   %s" % p.name)
+    return 0
+
+
+def cmd_latest(args):
+    d = find_dir()
+    if not d:
+        print("no %s directory here or above" % DIRNAME, file=sys.stderr)
+        return 1
+    good, bad = entries(d)
+    return _report(d, good, bad, verbose=False)
+
+
+def cmd_list(args):
+    d = find_dir()
+    if not d:
+        print("no %s directory here or above" % DIRNAME, file=sys.stderr)
+        return 1
+    good, bad = entries(d)
+    return _report(d, good, bad, verbose=True)
+
+
+def cmd_test(args):
+    """The rules, against cases. Each one would fail loudly if the rule it
+    covers stopped holding."""
+    import tempfile
+    ok = True
+
+    def check(label, got, want):
+        nonlocal ok
+        good = got == want
+        ok = ok and good
+        print("  %-5s %-46s %s" % ("ok" if good else "FAIL", label,
+                                   "" if good else "got %r want %r"
+                                   % (got, want)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / DIRNAME
+        d.mkdir()
+        os.chdir(tmp)
+
+        ns = argparse.Namespace(frm="alpha", to="beta", body=None)
+        cmd_new(ns)
+        good, bad = entries(d)
+        check("first handoff is 0001", good[0][0], 1)
+        check("direction recorded", (good[0][2], good[0][3]), ("alpha", "beta"))
+
+        ns = argparse.Namespace(frm="beta", to="alpha", body=None)
+        cmd_new(ns)
+        good, _ = entries(d)
+        check("second is 0002", good[-1][0], 2)
+        check("whose turn is the newest 'to'", good[-1][3], "alpha")
+
+        # The collision the O_EXCL loop exists for: a number already taken
+        # in the same minute must not be reused.
+        seq, when, frm, to, _ = good[-1]
+        clash = d / ("%04d-%s-x-to-y.md" % (seq + 1, when))
+        clash.write_text("squatter\n")
+        ns = argparse.Namespace(frm="alpha", to="beta", body=None)
+        cmd_new(ns)
+        good, _ = entries(d)
+        check("a taken number is skipped", good[-1][0], seq + 2)
+
+        (d / "HANDOFF.md").write_text("the old mutable kind\n")
+        good, bad = entries(d)
+        check("unorderable file is reported", [p.name for p in bad],
+              ["HANDOFF.md"])
+
+        check("ordering is numeric, not lexical",
+              [g[0] for g in good], sorted(g[0] for g in good))
+
+        ns = argparse.Namespace(frm="alpha", to="alpha", body=None)
+        check("refuses a handoff to itself", cmd_new(ns), 2)
+        ns = argparse.Namespace(frm="alpha", to="../etc", body=None)
+        check("refuses a name that is a path", cmd_new(ns), 2)
+
+    print("\n%s" % ("all checks passed" if ok else "FAILED"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="roost-handoff", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    n = sub.add_parser("new", help="write the next handoff")
+    n.add_argument("--to", required=True, help="the session taking over")
+    n.add_argument("--from", dest="frm", help="defaults to $ROOST_NAME")
+    n.add_argument("--body", help="text to put under the header")
+    n.set_defaults(fn=cmd_new)
+
+    sub.add_parser("latest", help="the newest handoff, and whose turn"
+                   ).set_defaults(fn=cmd_latest)
+    sub.add_parser("list", help="every handoff, newest first"
+                   ).set_defaults(fn=cmd_list)
+    ap.add_argument("--test", action="store_true",
+                    help="check the rules against their cases")
+
+    args = ap.parse_args()
+    if args.test:
+        return cmd_test(args)
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 0
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

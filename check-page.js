@@ -19,8 +19,9 @@ const ids = [...html.matchAll(/id="([\w-]+)"/g)].map(m => m[1]);
 const el = (id) => {
   const set = new Set();
   const e = {
-    id, textContent: "", innerHTML: "", scrollTop: 0, scrollHeight: 0,
-    clientHeight: 0, checked: false, dataset: {}, style: {}, contentDocument: null,
+    id, textContent: "", innerText: "", innerHTML: "", scrollTop: 0, scrollHeight: 0,
+    clientHeight: 0, checked: false, dataset: {}, contentDocument: null,
+    style: { setProperty() {}, removeProperty() {}, getPropertyValue: () => "" },
     classList: { add: c => set.add(c), remove: c => set.delete(c),
                  toggle: (c, on) => (on === undefined ? (set.has(c) ? set.delete(c) : set.add(c)) : (on ? set.add(c) : set.delete(c))),
                  contains: c => set.has(c) },
@@ -52,13 +53,18 @@ const ctx = {
             getComputedStyle: () => ({}), isSecureContext: false,
             addEventListener() {}, removeEventListener() {},
             setTimeout: () => 0, setInterval: () => 0 },
-  location: { search: "", href: "http://x/codex?file=f", origin: "http://x",
+  location: { search: "", hash: "", href: "http://x/codex?file=f", origin: "http://x",
               pathname: "/codex", toString() { return this.href; } }, navigator: { userAgent: "test" },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   performance: { now: () => 0 },
   fetch: () => Promise.resolve({ json: () => Promise.resolve({ html: "", total: 0 }) }),
   setTimeout: () => 0, setInterval: () => 0, clearTimeout() {}, clearInterval() {},
   requestAnimationFrame: () => 0, cancelAnimationFrame() {},
+  // Real ones, not stubs: a page that bounds a fetch so it cannot hang on a
+  // slow link should not have to ask whether the checker has heard of
+  // AbortController. Where the browser has a standard global, so does this.
+  AbortController, AbortSignal,
+  matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
   URL, URLSearchParams, history: { replaceState() {}, pushState() {} }, JSON, Math, Date, Set, Map, Array, Object, String, Number, Promise, encodeURIComponent,
 };
 ctx.window.location = ctx.location; ctx.globalThis = ctx;

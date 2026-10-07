@@ -26,8 +26,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -f config.json ] && [ "$FORCE" = 0 ]; then
-  echo "config.json already exists — nothing to do (use --force to rewrite it)."
+
+# Where the config goes. A roost-config directory beside this script wins
+# when it exists, matching where the server and restart.sh read from; a
+# fresh clone has none, so the file lands here as before.
+ROOST_CFG=config.json
+[ -d roost-config ] && ROOST_CFG=roost-config/config.json
+[ -n "${ROOST_CONFIG_DIR:-}" ] && ROOST_CFG="$ROOST_CONFIG_DIR/config.json"
+export ROOST_CFG
+
+if [ -f "$ROOST_CFG" ] && [ "$FORCE" = 0 ]; then
+  echo "$ROOST_CFG already exists — nothing to do (use --force to rewrite it)."
   exit 0
 fi
 
@@ -73,16 +82,16 @@ cfg = {
     "ttyd_socket": "~/.dtach/ttyd.sock",
     "folders": [],
 }
-open("config.json", "w").write(json.dumps(cfg, indent=2) + "\n")
-os.chmod("config.json", 0o600)'
-[ $? = 0 ] || { echo "could not write config.json" >&2; exit 1; }
+open(os.environ["ROOST_CFG"], "w").write(json.dumps(cfg, indent=2) + "\n")
+os.chmod(os.environ["ROOST_CFG"], 0o600)'
+[ $? = 0 ] || { echo "could not write $ROOST_CFG" >&2; exit 1; }
 
 umask 077
 mkdir -p "$HOME/.roost" "$HOME/.dtach"
 chmod 700 "$HOME/.roost" "$HOME/.dtach"
 
 echo
-echo "config.json written:"
+echo "$ROOST_CFG written:"
 echo "  repositories : $ROOT"
 echo "  login        : $LOGIN"
 echo

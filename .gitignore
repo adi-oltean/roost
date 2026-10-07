@@ -3,10 +3,27 @@ __pycache__/
 
 # The live config: the dashboard writes card_order and favorites into it, and
 # one machine's folder list is not another's. Start from config.example.json.
+# Its backups carry the same folder list and the same logins, and a timestamp
+# suffix put one outside the rule above -- untracked, but one `git add -A`
+# from being committed.
 config.json
+config.json.bak-*
+*.bak-*
+
+# The path/session mapping for one machine: project names, a home directory,
+# and who may write what. Same reason as above. It now lives in its own
+# private repository; this rule stays so a stray copy here cannot be
+# committed by accident. The format is documented by workspace.example.json.
+workspace.json
 
 # Scratch scripts and their output (tmp/ro, tmp/rw, tmp/shots).
 tmp/
 
 # The public repo, cloned here and tracked by its own git.
 /roost/
+
+# This machine's config, nested here so the file viewer and the terminal's
+# path links reach it from the session that maintains it. Its own repository
+# (private) tracks it; git never descends into a nested one, so this rule is
+# all that is needed.
+/roost-config/

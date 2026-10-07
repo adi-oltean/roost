@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Write down what a session is doing, and never decide anything.
+
+roost can see that a session has stopped — its own record says "waiting" —
+but not what it stopped on: an agent's proposed command is not written to its
+transcript until after somebody answers. So a card can say "stopped on a
+question" and nothing more, and the question sits there for as long as nobody
+looks.
+
+This is the missing sensor. Both Claude Code and codex run hooks around a
+tool call; this one attaches to those events, appends a line to
+~/.roost/events.jsonl and exits 0 with an empty mouth. It returns no
+decision, so it cannot allow, deny, or alter anything: the worst it can do is
+fail to write a line. What to make of those lines is roost's business, out
+here, where the policy can be read and changed without touching an agent's
+configuration.
+
+    ./roost-watch --install     what to add, and where
+    ./roost-watch --tail        the last events, as roost reads them
+    ./roost-watch --test        feed it one of each event
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+LOG = Path(os.path.expanduser("~")) / ".roost" / "events.jsonl"
+
+# A line is a few hundred bytes and a busy day is a few thousand lines, so
+# this is about a week of events, and two of them is the whole ceiling: the
+# current file and one previous. Nothing here grows without a limit, and
+# nothing is deleted that has not already been superseded once.
+CAP = 8 << 20                      # 8 MB, then it becomes the .old file
+
+
+def rotate():
+    """Replace rather than truncate: a reader holding the old file keeps
+    reading a whole file, instead of watching it vanish under them."""
+    try:
+        if LOG.exists() and LOG.stat().st_size > CAP:
+            LOG.replace(LOG.with_suffix(".jsonl.old"))
+    except OSError:
+        pass
+
+
+def record(data):
+    """One line per event: what happened, to which session, and — the point
+    of the exercise — which command it is about."""
+    ti = data.get("tool_input")
+    ti = ti if isinstance(ti, dict) else {}
+    cmd = ti.get("command") or ""
+    if isinstance(cmd, list):
+        cmd = " ".join(str(x) for x in cmd)
+    rec = {
+        "at": round(time.time(), 3),
+        "event": data.get("hook_event_name") or data.get("event") or "",
+        "session": data.get("session_id") or data.get("session") or "",
+        "cwd": data.get("cwd") or "",
+        "tool": data.get("tool_name") or data.get("tool") or "",
+        "id": str(data.get("tool_use_id") or data.get("call_id")
+                  or data.get("id") or "")[:64],
+        "cmd": str(cmd)[:400],
+    }
+    # Which roost session this is. The hook runs inside the agent's process
+    # tree, so it inherits the ROOST_NAME the session was started with, and
+    # the event carries the agent's current session id: together they tie a
+    # card to its transcript exactly -- including after a /clear starts a new
+    # one -- where matching by folder or by Claude's own per-PID records had
+    # to guess, and guessed wrong once those records stopped being written.
+    name = os.environ.get("ROOST_NAME") or os.environ.get("CCRC_NAME") or ""
+    if name and all(c.isalnum() or c in "-_" for c in name) and len(name) <= 64:
+        rec["name"] = name
+    # A permission question is the event worth having: it is the moment a
+    # session stops, and the only moment its command is legible.
+    for k in ("permission_mode", "permissionMode", "reason", "message"):
+        if data.get(k):
+            rec[k] = str(data[k])[:200]
+    return rec
+
+
+def main(argv):
+    if "--install" in argv:
+        print(INSTALL)
+        return 0
+    if "--tail" in argv:
+        return tail()
+    if "--test" in argv:
+        return selftest()
+
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = {"event": "unparsed", "raw": raw[:200]}
+    if not isinstance(data, dict):
+        data = {"event": "unparsed"}
+    try:
+        rotate()
+        LOG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with LOG.open("a") as fh:
+            fh.write(json.dumps(record(data)) + "\n")
+    except OSError:
+        pass                        # a sensor that fails is silent, not fatal
+    return 0                        # no stdout, ever: this decides nothing
+
+
+def events(limit=40):
+    try:
+        lines = LOG.read_text(errors="replace").splitlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except ValueError:
+            pass
+    return out
+
+
+def tail():
+    now = time.time()
+    for e in events():
+        print("%6.0fs ago  %-18s %-8s %-28s %s"
+              % (now - e.get("at", now), e.get("event", ""), e.get("tool", ""),
+                 Path(e.get("cwd", "")).name, (e.get("cmd") or "")[:60]))
+    return 0
+
+
+def selftest():
+    samples = [
+        {"hook_event_name": "SessionStart", "session_id": "t1", "cwd": "/tmp"},
+        {"hook_event_name": "PreToolUse", "session_id": "t1", "cwd": "/tmp",
+         "tool_name": "Bash", "tool_use_id": "toolu_1",
+         "tool_input": {"command": "cd /tmp && ls"},
+         "permission_mode": "default"},
+        {"hook_event_name": "PostToolUse", "session_id": "t1", "cwd": "/tmp",
+         "tool_name": "Bash", "tool_use_id": "toolu_1",
+         "tool_input": {"command": "cd /tmp && ls"}},
+        {"hook_event_name": "Stop", "session_id": "t1", "cwd": "/tmp"},
+    ]
+    for s in samples:
+        r = record(s)
+        print("  %-14s %-6s %-8s %s" % (r["event"], r["tool"], r["id"], r["cmd"][:34]))
+    print("  (nothing written: --test only shows what a line would hold)")
+    return 0
+
+
+INSTALL = """\
+roost-watch is a sensor. It answers nothing and alters nothing; it writes one
+line per event to ~/.roost/events.jsonl so roost can say what a session is
+stopped on.
+
+Claude Code — ~/.claude/settings.json, or pass --settings <file> for one
+session:
+
+  {
+    "hooks": {
+      "PreToolUse":   [{ "matcher": "*", "hooks": [{ "type": "command",
+                         "command": "/path/to/roost/roost-watch" }] }],
+      "PostToolUse":  [{ "matcher": "*", "hooks": [{ "type": "command",
+                         "command": "/path/to/roost/roost-watch" }] }],
+      "SessionStart": [{ "hooks": [{ "type": "command",
+                         "command": "/path/to/roost/roost-watch" }] }],
+      "Stop":         [{ "hooks": [{ "type": "command",
+                         "command": "/path/to/roost/roost-watch" }] }]
+    }
+  }
+
+codex — ~/.codex/config.toml, same four events plus PermissionRequest, which
+is the moment codex stops to ask:
+
+  [[hooks.PreToolUse]]
+  matcher = "*"
+  [[hooks.PreToolUse.hooks]]
+  type = "command"
+  command = "/path/to/roost/roost-watch"
+
+Then watch it fill:
+
+  ./roost-watch --tail
+"""
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

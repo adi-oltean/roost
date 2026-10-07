@@ -37,13 +37,29 @@ from pathlib import Path
 
 DTACH = Path.home() / ".dtach"
 
+def _config_path():
+    """Where the live config is, found the same way the server finds it.
+
+    A "roost-config" directory beside this script wins when it exists, which
+    is the arrangement that lets the config be a private repository of its
+    own rather than a gitignored file backed up nowhere. ROOST_CONFIG_DIR
+    overrides it. This script runs without the server, so it cannot ask the
+    server where to look."""
+    here = Path(__file__).resolve().parent
+    override = os.environ.get("ROOST_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser() / "config.json"
+    nested = here / "roost-config"
+    return (nested if nested.is_dir() else here) / "config.json"
+
+
 def _suffix():
     """The dashboard's display suffix. A session's roost name is the name on
     its card — @app2, not @app — and for a session still held by tmux that
     means the tmux name plus this. Sessions under dtach already carry it in
     their socket name, which is why only these two ever disagreed."""
     try:
-        cfg = json.loads((Path(__file__).resolve().parent / "config.json").read_text())
+        cfg = json.loads(_config_path().read_text())
         return cfg.get("display_suffix", "") or ""
     except (OSError, ValueError):
         return ""
@@ -290,9 +306,7 @@ def send_tmux(pane, text):
     tmux("send-keys", "-t", pane + ":", "Enter")
 
 
-def send_dtach(name, text):
-    sock = DTACH / name
-    data = (text + "\r").encode()
+def _push(sock, data):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.connect(str(sock))
@@ -301,6 +315,19 @@ def send_dtach(name, text):
             s.sendall(bytes([MSG_PUSH, len(chunk)]) + chunk.ljust(PUSH_MAX, b"\0"))
     finally:
         s.close()
+
+
+# The text, then the Enter on its own after a pause. In one write codex took
+# the Enter as part of the typing and left every message unsent in its
+# composer; a throwaway codex submitted only when the Enter came apart.
+SUBMIT_GAP_S = 1.5
+
+
+def send_dtach(name, text):
+    sock = DTACH / name
+    _push(sock, text.encode())
+    time.sleep(SUBMIT_GAP_S)
+    _push(sock, b"\r")
 
 
 def send(want, text):

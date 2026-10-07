@@ -8,11 +8,21 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Where the live config is. A roost-config directory beside this script wins
+# when it exists, which is what lets the config be a private repository of
+# its own rather than a gitignored file nothing has a copy of.
+# ROOST_CONFIG_DIR overrides it. Exported because the python3 programs below
+# are single-quoted, where a shell variable would not expand.
+ROOST_CFG=config.json
+[ -d roost-config ] && ROOST_CFG=roost-config/config.json
+[ -n "${ROOST_CONFIG_DIR:-}" ] && ROOST_CFG="$ROOST_CONFIG_DIR/config.json"
+export ROOST_CFG
+
 # The dashboard listens on a Unix socket, not a TCP port (see SECURITY.md).
-SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open("config.json")).get("socket","~/.roost/roost.sock")))')
+SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open(os.environ["ROOST_CFG"])).get("socket","~/.roost/roost.sock")))')
 NAMES=$(python3 -c '
-import json
-for e in json.load(open("config.json"))["folders"]:
+import json, os
+for e in json.load(open(os.environ["ROOST_CFG"]))["folders"]:
     print(e["name"] if isinstance(e, dict) else e.rstrip("/").split("/")[-1])')
 DASH_ONLY=0
 for a in "$@"; do
@@ -27,13 +37,13 @@ done
 # header on anything arriving through serve and overwrites a client's copy, so
 # setting it locally is not a way in from the tailnet; it is how a process on
 # this machine, which already has the machine, identifies itself.
-WHO=$(python3 -c 'import json
-a = json.load(open("config.json")).get("allow_logins") or []
+WHO=$(python3 -c 'import json, os
+a = json.load(open(os.environ["ROOST_CFG"])).get("allow_logins") or []
 print(a[0] if a else "")')
 AUTH=(); [ -n "$WHO" ] && AUTH=(-H "Tailscale-User-Login: $WHO")
 
 up() { curl -fsS --max-time 2 "${AUTH[@]}" --unix-socket "$SOCK" http://localhost/ >/dev/null 2>&1; }
-TTYD_SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open("config.json")).get("ttyd_socket","~/.dtach/ttyd.sock")))')
+TTYD_SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open(os.environ["ROOST_CFG"])).get("ttyd_socket","~/.dtach/ttyd.sock")))')
 export ROOST_TTYD_SOCK="$TTYD_SOCK"   # term.sh uses the same one
 
 # 1. This pane. A reboot leaves you in a tmux session named "0"; the roost

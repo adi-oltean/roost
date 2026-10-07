@@ -8,6 +8,10 @@ shell as the user running it. Everything below exists to make "can reach" and
 
 Read this before standing it up on a machine that is not your own.
 
+**The findings of the September 2026 review, and what was fixed, are in
+[`docs/security-audit-2026-09.md`](docs/security-audit-2026-09.md). roost is
+internal-only until its open items are settled.**
+
 ---
 
 ## Threat model
@@ -234,9 +238,16 @@ blocks, `Authorization: Bearer` headers and generic `password`/`secret`/
 `api_key` assignments. No matches. No `.env`, `*.pem`, `*.key`, `id_rsa*`,
 `.netrc` or `.credentials.json` has ever been committed.
 
-The live `config.json` is **not tracked** — the dashboard writes to it, and it
-holds one machine's folder list and one person's tailnet login.
-`config.example.json` is what ships.
+The live `config.json` is **not tracked by this repository** — the dashboard
+writes to it, and it holds one machine's folder list and one person's tailnet
+login. `config.example.json` is what ships.
+
+It can be kept in a repository of its own (`roost-config/` beside the code,
+or `ROOST_CONFIG_DIR`), which is how it gets versioned and backed up without
+this repository ever carrying it. **That repository must be private**: the
+folder list, the tailnet login and the clone URLs together describe somebody's
+machine, and none of it should be public even though none of it is a
+credential.
 
 The vendored libraries under `vendor/` are byte-identical to upstream
 (`katex.min.js` 0.16.11 and `highlight.min.js` 11.9.0 from cdnjs, verified by

@@ -118,13 +118,27 @@ for _d in (Path.home() / ".roost", Path.home() / ".dtach"):
     except OSError:
         pass
 
-# The live config is not in version control: the dashboard writes card_order
+# Where the config lives. A "roost-config" directory beside the code wins
+# if it is there, which is the arrangement that lets it be a private
+# repository of its own; otherwise the config sits next to the code, which
+# is what a fresh clone gets. ROOST_CONFIG_DIR overrides both for anyone who
+# wants it somewhere else entirely.
+#
+# A directory, not a symlinked file: write_private replaces a file by
+# rename, so a symlink at config.json would be destroyed the first time a
+# card was reordered -- silently, leaving the versioned copy stale.
+CONFIG_DIR = Path(os.environ.get("ROOST_CONFIG_DIR")
+                  or (ROOT / "roost-config" if (ROOT / "roost-config").is_dir()
+                      else ROOT)).expanduser()
+CONFIG = CONFIG_DIR / "config.json"
+
+# The live config is not in this repository: the dashboard writes card_order
 # and favorites back to it, and one machine's folder list is not another's. A
 # fresh clone therefore starts from the template rather than from a traceback.
 # This runs before anything else reads the file -- ccmsg, imported below,
 # reads it too.
-if not (ROOT / "config.json").exists() and (ROOT / "config.example.json").exists():
-    write_private(ROOT / "config.json", (ROOT / "config.example.json").read_text())
+if not CONFIG.exists() and (ROOT / "config.example.json").exists():
+    write_private(CONFIG, (ROOT / "config.example.json").read_text())
     print("config.json created from config.example.json -- edit it "
           "(allow_logins and folders at least), then restart")
 
@@ -136,6 +150,13 @@ _spec = _ilu.spec_from_loader("ccmsg", _ilm.SourceFileLoader(
     "ccmsg", str(Path(__file__).resolve().parent / "ccmsg")))
 ccmsg = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(ccmsg)
+
+# The command policy lives in its own file so it can be read and changed
+# without reading a web server. It decides; nothing here second-guesses it.
+_gspec = _ilu.spec_from_loader("roost_guard", _ilm.SourceFileLoader(
+    "roost_guard", str(Path(__file__).resolve().parent / "roost-guard")))
+guard = _ilu.module_from_spec(_gspec)
+_gspec.loader.exec_module(guard)
 
 def _build_id():
     """Short commit + the file's own mtime: the commit alone would not move
@@ -159,7 +180,7 @@ BUILD = _build_id()
 import uuid as _uuid
 SERVER_ID = _uuid.uuid4().hex[:8]
 SESS_DIR = Path.home() / ".claude" / "sessions"
-CFG = json.loads((ROOT / "config.json").read_text())
+CFG = json.loads(CONFIG.read_text())
 # Keys beginning with "_" are the template's own notes to the reader.
 CFG = {k: v for k, v in CFG.items() if not k.startswith("_")}
 # Unix sockets, not loopback TCP. Anything that can open 127.0.0.1 can send
@@ -403,6 +424,77 @@ def snippet(name):
     return " ".join(lines[-2:])[:200]
 
 
+# What a stopped session is stopped on.
+#
+# A session's own record says "waiting" and stops there: the command an agent
+# has proposed is not written to its transcript until somebody answers, so a
+# card could say a session was stuck without saying on what -- which is most
+# of why a question can sit for hours. roost-watch, a hook that decides
+# nothing, writes one line per tool call to ~/.roost/events.jsonl before the
+# question is asked. If it is installed, this reads it; if it is not,
+# everything below quietly returns nothing.
+EVENTS = Path.home() / ".roost" / "events.jsonl"
+_EV = {"mtime": 0.0, "rows": []}
+
+
+def agent_events(limit=600):
+    try:
+        st = EVENTS.stat()
+    except OSError:
+        return []
+    if st.st_mtime != _EV["mtime"]:
+        rows = []
+        try:
+            for ln in EVENTS.read_text(errors="replace").splitlines()[-limit:]:
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    rows.append(r)
+        except OSError:
+            rows = []
+        _EV["mtime"], _EV["rows"] = st.st_mtime, rows
+    return _EV["rows"]
+
+
+def pending_ask(cwd, since=0, max_age=7200):
+    """(command, when, how many more) for the call this folder's session is
+    stopped on, or None.
+
+    Announced and not yet finished is the test, and each call is paired with
+    its own completion: an agent can have several in flight, and a turn
+    ending is not an answer to any of them. The oldest open call is the one
+    being waited on -- anything newer arrived while it was already stuck."""
+    if not cwd:
+        return None
+    try:
+        want = str(Path(cwd).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return None
+    now = time.time()
+    open_calls = {}                       # key -> the announcement
+    for e in agent_events():
+        if str(e.get("cwd") or "") != want:
+            continue
+        key = e.get("id") or ("%s\x00%s" % (e.get("tool"), e.get("cmd")))
+        ev = e.get("event")
+        if ev == "PreToolUse":
+            open_calls[key] = e
+        elif ev == "PostToolUse":
+            open_calls.pop(key, None)
+        elif ev == "SessionEnd":
+            open_calls.clear()            # the session itself is gone
+    live = [e for e in open_calls.values()
+            if (e.get("cmd") or "").strip() and now - e.get("at", 0) < max_age
+            and e.get("at", 0) >= since - 5       # 5s of slack either way
+            and (want, (e.get("cmd") or "").strip()) not in _ANSWERED]
+    if not live:
+        return None
+    live.sort(key=lambda e: e.get("at", 0))
+    return (live[0]["cmd"].strip(), live[0].get("at", 0), len(live) - 1)
+
+
 def note_for(name, st):
     """'no reply since HH:MM' if a press went unanswered, else ''."""
     rec = PRESSED.get(name)
@@ -418,7 +510,11 @@ def type_into(name, text):
     """Type text into the session and press Enter (small pause so
     Claude Code's slash-command menu settles before submit)."""
     if is_dtach(name):
-        _dtach_push_path(dtach_sock(name), text)
+        # Text and Enter apart, never in one write: an agent that sees them
+        # arrive together takes the Enter as part of the typing.
+        _dtach_push_path(dtach_sock(name), text, newline=False)
+        time.sleep(0.6)
+        _dtach_push_path(dtach_sock(name), "")
         return
     tmux("send-keys", "-t", f"{name}:", "-l", text)
     time.sleep(0.4)
@@ -434,11 +530,203 @@ def paste_into(name, text):
         return
     tmux("send-keys", "-t", f"{name}:", "-l", text)
 
+SAY_MAX = 20000                      # characters in one message from the page
+
+
+def _clean_say(text):
+    """A message typed in the page, made safe to become keystrokes.
+
+    Newlines stay -- the message is pasted as one block, so they are part of
+    it rather than an early Enter. Every other control character goes,
+    including the C1 range: an ESC or a CSI in it would act on the
+    terminal instead of being read, and ESC [201~ would end the paste early
+    and turn the rest into keys."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+    text = _re.sub(r"[\x00-\x09\x0b-\x1f\x7f\x80-\x9f]", "", text)
+    return text.strip()
+
+
+def say_target(name):
+    """(kind, card, transport, error) for the name a terminal page carries.
+
+    A Claude card's page is named card + display suffix; a codex terminal's
+    is its own name. Either way the session has to have an agent in front
+    right now -- ccmsg's test, which reads the foreground process -- because
+    an Enter typed into a plain shell runs whatever came before it."""
+    card = name[:-len(SUFFIX)] if SUFFIX and name.endswith(SUFFIX) else name
+    if card in FOLDERS:
+        kind = "claude"
+    elif (Path.home() / ".dtach" / (name + ".cmd")).exists():
+        kind, card = "codex", name
+    else:
+        return "", "", "", "unknown session"
+    hit = [t for t in ccmsg.targets() if t[1] == name]
+    if not hit:
+        return "", "", "", "no agent is running in @%s" % name
+    return kind, card, hit[0][3], ""
+
+
+def say_waiting(kind, card):
+    """Stopped on a question: a permission, a trust prompt, a menu. Typed
+    text and an Enter would answer it, and the highlighted answer is
+    usually yes -- so nothing is sent until a person has answered it."""
+    if kind == "claude":
+        return waiting_on_question(card)
+    said = screen_says(card)
+    if bool(said and said.get("asking")) or replay_asking(card):
+        return True
+    try:
+        cmd = (Path.home() / ".dtach" / (card + ".cmd")).read_text()
+    except OSError:
+        cmd = ""
+    return codex_awaiting(cmd)
+
+
+# How long to wait between a paste and its Enter. codex takes an Enter that
+# follows a paste too closely as part of it -- a new line, not a send -- and
+# every message from the web view sat unsent in its composer: a throwaway
+# codex left "/status" unsubmitted with 0.4 s and ran it with 1.5 s.
+SUBMIT_GAP = {"codex": 1.5, "claude": 0.4}
+
+
+def say_into(name, card, transport, text, kind="claude"):
+    """Paste text into the agent's composer as one block, then submit it.
+
+    Bracketed paste is the form both agents already accept from a terminal
+    paste: lines arrive as lines, and a block of them is not cut short at
+    the first newline. The pause lets the paste settle before the Enter --
+    long enough for codex, which drops an Enter that comes too soon."""
+    gap = SUBMIT_GAP.get(kind, 1.5)
+    if transport == "dtach":
+        sock = Path.home() / ".dtach" / name
+        body = "\x1b[200~" + text.replace("\n", "\r") + "\x1b[201~"
+        _dtach_push_path(sock, body, newline=False)
+        time.sleep(gap)
+        _dtach_push_path(sock, "")
+        return
+    tmux("set-buffer", "-b", "roost-say", text)
+    tmux("paste-buffer", "-p", "-d", "-b", "roost-say", "-t", f"{card}:")
+    time.sleep(0.4)
+    tmux("send-keys", "-t", f"{card}:", "Enter")
+
+
+SAID_LOG = Path.home() / ".roost" / "said.jsonl"
+SAID_SHOWN_S = 6 * 3600              # how far back the page looks for them
+
+
+def said_log(name, text, paths):
+    """Every message sent from the page, kept.
+
+    An agent writes a message to its transcript when it takes it, not when
+    it arrives: a busy Claude Code holds a queued one for as long as it is
+    working. Until then this is the only record that it was sent at all,
+    and the page shows it from here -- on any device, across reloads --
+    until the transcript has it."""
+    try:
+        SAID_LOG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if SAID_LOG.exists() and SAID_LOG.stat().st_size > (8 << 20):
+            SAID_LOG.replace(SAID_LOG.with_suffix(".jsonl.old"))
+        fd = os.open(SAID_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(json.dumps({"t": time.time(), "name": name, "text": text,
+                                 "images": [Path(p).name for p in paths]}) + "\n")
+    except OSError:
+        pass
+
+
+def user_turns(path, since):
+    """[{t, text}]: the messages a person sent that a transcript recorded at
+    or after `since` (epoch seconds), oldest first.
+
+    What the web view needs to settle a queued message: recorded, or passed
+    over -- a later message got in and this one never did, as when an
+    approval prompt swallowed it. Text alone could not say the second, and
+    kept such messages queued forever. Read from the tail; recent is all
+    the question is ever about."""
+    import datetime as _dt
+    out = []
+    try:
+        size = path.stat().st_size
+        start = max(0, size - (8 << 20))
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+        if start:
+            lines = lines[1:]                 # the half line at the seam
+    except OSError:
+        return out
+    claude = CLAUDE_PROJECTS in path.parents
+    for line in lines:
+        o = _jobj(line)
+        if not isinstance(o, dict):
+            continue
+        ts = o.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        try:
+            t = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if t < since:
+            continue
+        text = None
+        if claude:
+            q = _queued(o)
+            if q and q[0] == "user":
+                text = q[1]
+            elif o.get("type") == "user" and not o.get("isMeta"):
+                c = (o.get("message") or {}).get("content")
+                if isinstance(c, str):
+                    text = c
+                elif isinstance(c, list) and not any(
+                        isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                    text = " ".join(b.get("text") or "" for b in c if isinstance(b, dict))
+        else:
+            pl = o.get("payload") or {}
+            if o.get("type") == "response_item" and pl.get("type") == "message" \
+               and pl.get("role") == "user":
+                text = _text_of(pl.get("content"))
+                if text.lstrip().startswith("<"):
+                    text = None               # environment, not a person
+        if text:
+            out.append({"t": t, "text": text[:4000]})
+    return out[-200:]
+
+
+def said_recent(name):
+    """This session's messages from the page, newest last, recent ones only."""
+    out, cut = [], time.time() - SAID_SHOWN_S
+    try:
+        with SAID_LOG.open() as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("name") == name and r.get("t", 0) >= cut:
+                    out.append(r)
+    except OSError:
+        pass
+    return out[-50:]
+
+
 def send_enter(name):
     if is_dtach(name):
         _dtach_push_path(dtach_sock(name), "")
         return
     tmux("send-keys", "-t", f"{name}:", "Enter")
+
+def clear_composer(name):
+    """Ctrl-U: take back a line that was typed but never went anywhere.
+
+    Text left in a composer is indistinguishable from something the user
+    typed, and one of roost's own sentences was found sitting in a prompt
+    hours after it was written, waiting for a person to notice it. Roost
+    should leave no trace of a message it could not deliver."""
+    if is_dtach(name):
+        _dtach_push_path(dtach_sock(name), "\x15", newline=False)
+        return
+    tmux("send-keys", "-t", f"{name}:", "C-u")
 
 
 def dismiss_rc_dialog(name, tries=8):
@@ -726,6 +1014,64 @@ def press(name):
     return f"/rc {name}{SUFFIX} sent" + ("" if dismissed else " (no dialog seen)")
 
 
+def stop_dtach(sock):
+    """Take a dtach session down: the program first, while it still has a
+    terminal to be told on, then the master, then any leftover -- the order
+    restart uses, for the same reason (a program whose master dies first
+    survives orphaned, holding its conversation open). SIGTERM is how both
+    agents are asked to go: they save and exit. Nothing is typed into the
+    session, so a question on screen cannot be answered by stopping it."""
+    master, kids = dtach_tree(sock)
+    for pid in reversed(kids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for _ in range(30):
+        if not any(Path("/proc/%d" % p).exists() for p in kids):
+            break
+        time.sleep(0.1)
+    for pid in master:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    time.sleep(0.5)
+    master2, kids2 = dtach_tree(sock)
+    for pid in kids2 + master2:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        if sock.exists():
+            sock.unlink()
+    except OSError:
+        pass
+    return not dtach_tree(sock)[0]
+
+
+def stop_session(name):
+    """(ok, message). A card's Stop: the session goes down, its definition
+    stays, and Start brings it back on the same conversation."""
+    if name.startswith("term:"):
+        t = name[len("term:"):]
+        if not t or not all(c.isalnum() or c in "-_" for c in t):
+            return False, "bad name"
+        sock = Path.home() / ".dtach" / t
+        if not sock.exists() and not dtach_tree(sock)[0]:
+            return True, "not running"
+        return (True, "stopped") if stop_dtach(sock) else (False, "could not stop it")
+    if name not in FOLDERS:
+        return False, "unknown session"
+    if is_dtach(name):
+        return (True, "stopped") if stop_dtach(dtach_sock(name)) else (False, "could not stop it")
+    if state_of(name) == "dead":
+        return True, "not running"
+    tmux("kill-session", "-t", "=" + name)
+    return True, "stopped"
+
+
 def restart(name):
     """Exit the session's claude and bring it back on the same conversation.
 
@@ -852,6 +1198,89 @@ def repo_tree(limit=400, depth=5, budget=8000):
             "repos": len(found), "cut": cut}
 
 
+# Where a new repository's CLAUDE.md comes from, when asked for one.
+TEMPLATE_DIR = Path(CFG.get("claude_md_template")
+                    or "~/src/claude-md-template").expanduser()
+
+
+def _template_files():
+    """The template's instruction files: CLAUDE.md, its CLAUDE-*.md
+    companions and the Claude-*.md guides it points at. Top level and
+    regular files only.
+
+    Its .claude/settings.json is deliberately not among them: it pre-approves
+    python3, git push, cp and mv, and copying it would widen what an agent
+    may do unasked in every repository made this way. That is a choice for
+    a person, not a side effect of a button."""
+    if not TEMPLATE_DIR.is_dir():
+        return []
+    out = []
+    for f in sorted(TEMPLATE_DIR.iterdir()):
+        if (f.name == "CLAUDE.md" or f.name.startswith(("CLAUDE-", "Claude-"))) \
+                and f.suffix == ".md" and f.is_file() and not f.is_symlink():
+            out.append(f)
+    return out
+
+
+def new_repo(parent, name, agent="claude", template=True):
+    """Make <parent>/<name> a fresh repository. Returns (path, error, note);
+    the note says what became of the template, since a commit can fail on
+    its own (no git identity) and should not do so silently.
+
+    The parent need not be a repository -- the root itself is the usual
+    one. Every check add_session would make on the card is made first, so a
+    refused card never leaves a folder behind."""
+    def no(why):
+        return "", why, ""
+    try:
+        p = Path(parent).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError):
+        return no("not a path")
+    if not p.is_dir():
+        return no("no such folder")
+    if not p.is_relative_to(SRC.resolve()):
+        return no("outside %s" % SRC)
+    name = (name or "").strip()
+    if not name or not all(c.isalnum() or c in "-_" for c in name):
+        return no("a name may hold letters, digits, - and _ only")
+    if name in card_names():
+        return no("there is already a card called %s" % name)
+    if (Path.home() / ".dtach" / (name + ".cmd")).exists():
+        return no("there is already a terminal called %s" % name)
+    if agent not in ("claude", "codex"):
+        return no("unknown agent")
+    d = p / name
+    if d.exists():
+        return no("%s already exists" % d)
+    try:
+        d.mkdir()
+    except OSError as e:
+        return no("could not create %s: %s" % (d, e))
+    pinned = []
+    for kv in _GIT_PINNED + ["init.templateDir=", "commit.gpgsign=false"]:
+        pinned += ["-c", kv]
+    rc, _ = _run_git(["git"] + pinned + ["init", "-q"], d, 15)
+    if rc != 0:
+        return no("created %s but git init failed" % d)
+    files = _template_files() if template else []
+    note = ""
+    if files:
+        import shutil
+        for f in files:
+            shutil.copyfile(f, d / f.name)
+        _, sha = _run_git(["git"] + pinned + ["rev-parse", "--short", "HEAD"],
+                          TEMPLATE_DIR, 5)
+        _run_git(["git"] + pinned + ["add", "--"] + [f.name for f in files], d, 15)
+        rc, _ = _run_git(["git"] + pinned + ["commit", "-q", "-m",
+                         "start from claude-md-template %s" % (sha or "")], d, 15)
+        note = ("CLAUDE.md from the template, committed" if rc == 0 else
+                "CLAUDE.md from the template, staged but not committed "
+                "(is a git identity set?)")
+    elif template:
+        note = "no template found at %s" % TEMPLATE_DIR
+    return str(d), "", note
+
+
 def add_session(path, name="", agent="claude"):
     """Make a new session for a folder. Returns (card name, error).
 
@@ -890,11 +1319,11 @@ def add_session(path, name="", agent="claude"):
     rel = str(d.relative_to(SRC.resolve()))
     entry = rel if Path(rel).name == name else {"path": rel, "name": name}
     with _CFG_LOCK:
-        cfg = json.loads((ROOT / "config.json").read_text())
+        cfg = json.loads(CONFIG.read_text())
         folders = cfg.get("folders") or []
         folders.append(entry)
         cfg["folders"] = folders
-        write_private(ROOT / "config.json", json.dumps(cfg, indent=2) + "\n")
+        write_private(CONFIG, json.dumps(cfg, indent=2) + "\n")
         FOLDERS.clear()
         FOLDERS.update(_folders(folders))
     return name, ""
@@ -919,7 +1348,7 @@ def reorder(names):
     order of the sessions it does describe, and "card_order" records the full
     arrangement. Entries keep whichever form they had (plain string or
     {path, name})."""
-    cfg = json.loads((ROOT / "config.json").read_text())
+    cfg = json.loads(CONFIG.read_text())
     by_name = {}
     for e in cfg.get("folders") or []:
         n = e["name"] if isinstance(e, dict) else Path(str(e).strip("/")).name
@@ -931,7 +1360,7 @@ def reorder(names):
         return False, "order does not match the dashboard; refresh and retry"
     cfg["card_order"] = list(names)
     cfg["folders"] = [by_name[n] for n in names if n in by_name]
-    write_private(ROOT / "config.json", json.dumps(cfg, indent=2) + "\n")
+    write_private(CONFIG, json.dumps(cfg, indent=2) + "\n")
     fresh = _folders(cfg["folders"])
     FOLDERS.clear()
     FOLDERS.update(fresh)   # dicts keep insertion order, which is button order
@@ -1143,6 +1572,204 @@ def codex_target(cwd):
 
 
 
+# ------------------------------------------------- terminal replay buffer
+# How much of each session's recent output to keep for the next client to
+# connect. 0 disables it entirely, which is the default: this sits on the
+# byte path of every terminal.
+REPLAY_BYTES = int(CFG.get("term_replay_bytes") or 0)
+_REPLAY = {}                      # session name -> [frames, total bytes]
+_REPLAY_LOCK = _thr.Lock()
+
+
+def _ws_frames(buf):
+    """Split a server-to-client websocket byte run into whole frames.
+
+    Returns (frames, leftover). ttyd's frames to the browser carry no mask,
+    so the length is the second byte and its extensions -- enough to find
+    the boundaries without reading the payload."""
+    out, i = [], 0
+    n = len(buf)
+    while i + 2 <= n:
+        ln = buf[i + 1] & 0x7F
+        masked = buf[i + 1] & 0x80
+        j = i + 2
+        if ln == 126:
+            if j + 2 > n:
+                break
+            ln = int.from_bytes(buf[j:j + 2], "big")
+            j += 2
+        elif ln == 127:
+            if j + 8 > n:
+                break
+            ln = int.from_bytes(buf[j:j + 8], "big")
+            j += 8
+        if masked:                # not expected from a server; give up
+            return out, buf[i:]
+        if j + ln > n:
+            break
+        out.append(bytes(buf[i:j + ln]))
+        i = j + ln
+    return out, buf[i:]
+
+
+def _ttyd_output(f):
+    """True for a frame worth replaying: whole, uncompressed, data, and
+    carrying ttyd's OUTPUT command.
+
+    Everything else must stay out. A close frame from the last connection,
+    replayed first thing to the next, closes it -- and the page reconnects
+    into the same close, forever. Title and preference messages belong to
+    the connection that asked for them; a compressed or fragmented frame
+    cannot stand on its own."""
+    if len(f) < 3:
+        return False
+    b0 = f[0]
+    if b0 & 0x80 == 0 or b0 & 0x70 or (b0 & 0x0F) not in (1, 2):
+        return False
+    ln = f[1] & 0x7F
+    off = 2 + (2 if ln == 126 else 8 if ln == 127 else 0)
+    return len(f) > off and f[off:off + 1] == b"0"
+
+
+def _replay_keep(name, frames):
+    if not REPLAY_BYTES or not name or not frames:
+        return
+    frames = [f for f in frames if _ttyd_output(f)]
+    if not frames:
+        return
+    with _REPLAY_LOCK:
+        rec = _REPLAY.setdefault(name, [[], 0])
+        for f in frames:
+            rec[0].append(f)
+            rec[1] += len(f)
+        # Drop whole frames from the front until it fits. Never a partial
+        # one: half a frame is not a frame.
+        while rec[1] > REPLAY_BYTES and len(rec[0]) > 1:
+            rec[1] -= len(rec[0].pop(0))
+
+
+def _replay_take(name):
+    if not REPLAY_BYTES or not name:
+        return b""
+    with _REPLAY_LOCK:
+        rec = _REPLAY.get(name)
+        return b"".join(rec[0]) if rec else b""
+
+
+# The replay lives in memory, so every restart emptied it -- and a deploy is
+# a restart. After each one a phone reconnected to nothing, with no
+# scrollback to drag down into, which read as scrolling broken yet again.
+# It is written to disk on the way down (and every minute, for a kill that
+# allows no way down) and read back on the way up. Terminal output, so it
+# is kept the way the rest of ~/.roost is: 0700 directory, 0600 files.
+REPLAY_DIR = Path.home() / ".roost" / "replay"
+REPLAY_STALE_S = 24 * 3600
+
+
+def replay_save():
+    if not REPLAY_BYTES:
+        return
+    with _REPLAY_LOCK:
+        snap = {n: b"".join(r[0]) for n, r in _REPLAY.items()}
+    try:
+        REPLAY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for n, data in snap.items():
+            tmp = REPLAY_DIR / (n + ".bin.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, REPLAY_DIR / (n + ".bin"))
+    except OSError:
+        pass
+
+
+def replay_load():
+    if not REPLAY_BYTES or not REPLAY_DIR.is_dir():
+        return
+    for p in REPLAY_DIR.glob("*.bin"):
+        n = p.stem
+        if not all(c.isalnum() or c in "-_" for c in n):
+            continue
+        try:
+            if time.time() - p.stat().st_mtime > REPLAY_STALE_S:
+                continue
+            frames, _ = _ws_frames(p.read_bytes())
+        except OSError:
+            continue
+        _replay_keep(n, frames)
+
+
+def _replay_saver():
+    while True:
+        time.sleep(60)
+        replay_save()
+
+
+def _warm_transcripts():
+    """Read the newest transcripts once, at start.
+
+    The conversation cache lives in memory, so every restart -- every
+    deploy -- left the first view of a large session to pay for parsing the
+    whole file, the better part of a second for 46 MB. Done here, in the
+    background, that cost is gone before anyone asks; a request that does
+    arrive first waits on the same per-file lock instead of parsing twice."""
+    try:
+        for x in claude_files(8) + codex_files(8):
+            p = _codex_path(x["file"])
+            if p is not None:
+                rollout_conv(p)
+    except Exception:
+        pass                          # an optimisation; never a reason to fail
+
+
+# A codex approval prompt, as it ends: the footer codex draws under every
+# "may I run this?" question. Matched only in the last stretch of output, so
+# a prompt that was answered and drawn over no longer counts.
+_ASK_FOOTERS = ("press enter to confirm or esc to cancel",)
+
+
+def replay_asking(name):
+    """Is the latest output of this terminal a codex approval prompt?
+
+    The page can tell the dashboard what a terminal shows only while a tab
+    has that terminal open, and nothing else knew: a session sat for hours on
+    "Yes, proceed?" with its card reading idle, and a message sent from the
+    web view was not held back from it. The replay buffer has the same
+    bytes the screen was drawn from, kept server-side, so the question is
+    answerable here -- for as long as the prompt was drawn while some tab
+    was connected, which is when the relay saw it."""
+    with _REPLAY_LOCK:
+        rec = _REPLAY.get(name)
+        frames = list(rec[0][-60:]) if rec else []
+    out = bytearray()
+    for f in frames:
+        ln = f[1] & 0x7F
+        off = 2 + (2 if ln == 126 else 8 if ln == 127 else 0)
+        if f[off:off + 1] == b"0":
+            out += f[off + 1:]
+    text = out.decode("utf-8", "replace")
+    text = _re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", " ", text)
+    text = _re.sub(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b.", " ", text)
+    norm = " ".join(text.split()).lower()
+    # The footer has to be the last thing drawn, give or take a short line:
+    # once the prompt is answered, whatever codex draws next comes after it.
+    for f in _ASK_FOOTERS:
+        k = norm.rfind(f)
+        if k >= 0 and len(norm) - (k + len(f)) < 160:
+            return True
+    return False
+
+
+def _term_arg(path):
+    """The session a /term request is for, from ttyd's own ?arg=."""
+    try:
+        from urllib.parse import parse_qs, urlparse
+        v = (parse_qs(urlparse(path).query).get("arg") or [""])[0]
+    except Exception:
+        return ""
+    return v if v and all(c.isalnum() or c in "-_" for c in v) else ""
+
+
 def term_relay(h):
     """Proxy this request to ttyd, websocket and all. True if it was handled.
 
@@ -1171,6 +1798,13 @@ def term_relay(h):
             if k.lower() in ("connection", "keep-alive", "proxy-connection",
                              "host"):
                 continue                      # hop-by-hop, or set above
+            # ttyd accepts permessage-deflate with server context takeover:
+            # each frame decodes only against the ones before it on the same
+            # connection. Replayed into a new one they are garbage, the
+            # browser fails the socket, reconnects, gets them again -- every
+            # terminal cycling. With replay on, frames go uncompressed.
+            if REPLAY_BYTES and k.lower() == "sec-websocket-extensions":
+                continue
             head.append("%s: %s" % (k, v))
         # Never keep-alive, unless this is the websocket handshake. Relaying
         # hands this socket to ttyd for good: from here on the bytes are
@@ -1217,6 +1851,18 @@ def term_relay(h):
 
         down = h.connection
         h.close_connection = True             # this socket is ours now
+
+        # Hand the new client what the last one saw, before anything live.
+        # This is what puts scrollback back on a phone, where the tab that
+        # held it is long gone.
+        name = _term_arg(h.path) if upgrade else ""
+        if name:
+            old = _replay_take(name)
+            if old:
+                try:
+                    down.sendall(old)
+                except OSError:
+                    pass
         # The 5s was for connecting. Left in place it becomes an IDLE
         # timeout: a terminal sitting quietly for five seconds looked like a
         # dead upstream, the relay tore the connection down, and the page
@@ -1224,13 +1870,22 @@ def term_relay(h):
         # no idle limit — that is the whole point of a terminal.
         up.settimeout(None)
         down.settimeout(None)
-        def pump(src, dst):
+        def pump(src, dst, keep=""):
+            # keep names the session when this is the direction carrying
+            # ttyd's output; the other direction is keystrokes and is not
+            # worth remembering.
+            tail = b""
             try:
                 while True:
                     b = src.recv(65536)
                     if not b:
                         break
                     dst.sendall(b)
+                    if keep:
+                        frames, tail = _ws_frames(tail + b)
+                        _replay_keep(keep, frames)
+                        if len(tail) > 1 << 20:
+                            tail = b""        # desynchronised; start over
             except OSError:
                 pass
             finally:
@@ -1241,7 +1896,7 @@ def term_relay(h):
                         pass
         t = threading.Thread(target=pump, args=(down, up), daemon=True)
         t.start()
-        pump(up, down)
+        pump(up, down, name)
         t.join(timeout=1)
     finally:
         try:
@@ -3121,6 +3776,14 @@ __INTER__
   h2 { font-size: .95rem; font-weight: 600; margin: 1.1rem 0 .35rem;
        color: var(--c-muted); text-transform: uppercase;
        letter-spacing: .04em; }
+  /* A heading for the notes belonging to one row of the table above it.
+     Subordinate to h2 by every means available -- smaller, dimmer, not
+     uppercase -- because the browser default made it the loudest thing on
+     a page whose headings are otherwise deliberately quiet. */
+  h3 { font-size: .85rem; font-weight: 600; margin: .9rem 0 .3rem;
+       color: var(--c-muted); opacity: .85; padding-left: .75rem;
+       border-left: 2px solid rgba(255,255,255,.12); }
+  h3 + table { margin-left: .75rem; }
   __EXTRA__
 </style></head><body>
 <header>
@@ -3894,9 +4557,28 @@ def _json_cell(v):
     if isinstance(v, (int, float)):
         return _html.escape("{:,}".format(v) if isinstance(v, int) else repr(v)), True
     if isinstance(v, list):
+        # A short list of scalars is worth showing: it is usually the answer,
+        # not a container.
+        flat = [x for x in v[:6] if not isinstance(x, (dict, list))]
+        if v and len(flat) == len(v) and len(v) <= 6:
+            inline = ", ".join(_html.escape(str(x))[:40] for x in v)
+            if len(inline) <= 160:
+                return inline, False
         return '<span class="muted">[%d items]</span>' % len(v), False
     if isinstance(v, dict):
-        return '<span class="muted">{%d keys}</span>' % len(v), False
+        scal = [k for k, x in v.items() if not isinstance(x, (dict, list))]
+        if v and len(scal) == len(v) and len(v) <= 6:
+            inline = ", ".join("%s: %s" % (_html.escape(str(k)),
+                                           _html.escape(str(x))[:40])
+                               for k, x in v.items())
+            if len(inline) <= 200:
+                return inline, False
+        # Name what is in there rather than counting it. "{9 keys}" tells a
+        # reader only that they are not being shown the thing they opened
+        # the file for.
+        names = ", ".join(_html.escape(str(k)) for k in list(v)[:5])
+        return ('<span class="muted">{%s%s}</span>'
+                % (names, " …" if len(v) > 5 else "")), False
     t = str(v)
     return _html.escape(t if len(t) <= 300 else t[:300] + " …"), False
 
@@ -3928,6 +4610,44 @@ def _rows_table(items):
             % ("".join("<th>%s</th>" % _html.escape(str(c)) for c in cols),
                "".join(body), extra))
 
+def _keyed_rows_table(d):
+    """A dict whose values are records: one row each, keyed by its name.
+
+    {"a": {...}, "b": {...}} is a table with an extra first column, not a
+    list of unrelated sections -- and reading it as a table is the only way
+    to compare the entries, which is usually why it was opened."""
+    seen = {}
+    for v in d.values():
+        if isinstance(v, dict):
+            for a in v:
+                seen[str(a)] = seen.get(str(a), 0) + 1
+    # A name for the key column that none of the records already uses.
+    head = next((c for c in ("key", "name", "id", "entry", "_key")
+                 if c not in seen), "_key")
+
+    # What every row answers is a column. What one row answers is a note
+    # about that row: as a column it is empty everywhere else and squeezes
+    # the columns that mean something. Keys a config keeps for its reader
+    # are "_" prefixed by convention and are prose, never comparable.
+    cols = [a for a, n in seen.items()
+            if n >= 2 and not a.startswith("_")]
+    notes = [a for a in seen if a not in cols]
+
+    items = []
+    for k, v in d.items():
+        row = {head: k}
+        row.update({str(a): b for a, b in v.items() if str(a) in cols})
+        items.append(row)
+    out = [_rows_table(items)]
+
+    for k, v in d.items():
+        extra = {a: b for a, b in v.items() if str(a) in notes}
+        if extra:
+            out.append('<h3>%s</h3>%s'
+                       % (_html.escape(str(k)), _kv_table(extra)))
+    return "".join(out)
+
+
 def _json_tables(obj):
     """Tables when the shape is tabular, else None.
 
@@ -3945,7 +4665,21 @@ def _json_tables(obj):
         parts.append(_kv_table(flat))
     for k, v in obj.items():
         if isinstance(v, dict) and v:
-            parts.append("<h2>%s</h2>%s" % (_html.escape(str(k)), _kv_table(v)))
+            # Records keyed by name tabulate; a plain record does not. The
+            # notes a config keeps for its reader are conventionally "_"
+            # prefixed, and they are prose rather than another record, so
+            # they are shown beneath rather than forced into a column.
+            recs = {a: b for a, b in v.items() if isinstance(b, dict) and b}
+            rest = {a: b for a, b in v.items() if not (isinstance(b, dict) and b)}
+            if len(recs) >= 2:
+                parts.append("<h2>%s <span class=\"muted\">%d</span></h2>%s"
+                             % (_html.escape(str(k)), len(recs),
+                                _keyed_rows_table(recs)))
+                if rest:
+                    parts.append(_kv_table(rest))
+            else:
+                parts.append("<h2>%s</h2>%s"
+                             % (_html.escape(str(k)), _kv_table(v)))
         elif isinstance(v, list) and v:
             if all(isinstance(x, dict) for x in v[:200]):
                 parts.append("<h2>%s <span class=\"muted\">%d</span></h2>%s"
@@ -4466,6 +5200,72 @@ def ensure_claude_term(tmux_name):
         return ""
     return name
 
+def session_id_for(name):
+    """The agent session id behind a roost name, from evidence only, or "".
+
+    First the hook log: roost-watch records ROOST_NAME with the session id
+    of every event, so the latest event for the name is the current session
+    -- still right after a /clear. Failing that (a session that has not run a
+    hook since it started), the live process itself: Claude Code puts its
+    session id in CLAUDE_CODE_SESSION_ID, next to the ROOST_NAME the session
+    was launched with. Never the newest file in a folder: another run in the
+    same folder would win that, and show somebody else's conversation.
+
+    The name in the log is only as good as the environment the hook ran in,
+    and codex runs every session's hooks in one shared app-server, started
+    by whichever session came first and carrying that session's ROOST_NAME:
+    a second session's events were logged under the first one's name, and
+    the first one's page opened the second one's conversation. So an event
+    counts only from the folder the session runs in."""
+    if not name or not all(c.isalnum() or c in "-_" for c in name):
+        return ""
+    try:
+        home = _codex_cwd((Path.home() / ".dtach" / (name + ".cmd")).read_text())
+    except OSError:
+        home = ""
+    log = Path.home() / ".roost" / "events.jsonl"
+    try:
+        with log.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - (1 << 20)))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        tail = []
+    for ln in reversed(tail):
+        if ('"name": "%s"' % name) not in ln:
+            continue
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict) or (home and ev.get("cwd") != home):
+            continue
+        sid = ev.get("session") or ""
+        if isinstance(sid, str) and sid and all(c.isalnum() or c in "-_" for c in sid):
+            return sid
+    want = ("ROOST_NAME=" + name).encode()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        pids = []
+    for p in pids:
+        try:
+            if Path("/proc/%s/comm" % p).read_text().strip() != "claude":
+                continue
+            env = Path("/proc/%s/environ" % p).read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if want not in env:
+            continue
+        for kv in env:
+            if kv.startswith(b"CLAUDE_CODE_SESSION_ID="):
+                sid = kv.split(b"=", 1)[1].decode(errors="replace")
+                if sid and all(c.isalnum() or c in "-_" for c in sid):
+                    return sid
+    return ""
+
+
 def claude_sid_by_tmux():
     """tmux session name -> transcript id, for the live Claude sessions.
     The two halves of a session -- its pane and its transcript -- are found
@@ -4476,16 +5276,63 @@ def claude_sid_by_tmux():
             out.setdefault(f["name"], f["file"])
     return out
 
+def _queued(o):
+    """(who, text) for a message Claude Code took while it was working, or
+    None for any other line.
+
+    A message typed while Claude Code is busy is not written as a "user"
+    record. It is queued, and when Claude Code takes it the transcript gets
+    an "attachment" of type queued_command carrying the prompt. Reading only
+    "user" records dropped every one of them -- which is most of what anyone
+    types, since the agent is usually busy -- and that is how messages
+    vanished from the history.
+
+    who is "user" for something a person typed, and "env" for the rest that
+    arrives the same way: background-task notices, other sessions' messages,
+    subagent hand-backs. Older transcripts carry no origin; a prompt there
+    is a person's unless it opens with one of those tags."""
+    if o.get("type") != "attachment":
+        return None
+    a = o.get("attachment") or {}
+    if a.get("type") != "queued_command":
+        return None
+    p = a.get("prompt")
+    if isinstance(p, str):
+        text = p
+    else:
+        parts = []
+        for b in p or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            elif b.get("type") == "image":
+                parts.append("[image]")
+        text = "\n".join(x for x in parts if x)
+    origin = a.get("origin") or {}
+    human = (a.get("commandMode") == "prompt"
+             and (origin.get("kind") == "human"
+                  or (not origin and not text.lstrip().startswith(
+                      ("<task-notification", "<cross-session-message", "<agent-message")))))
+    return ("user" if human else "env"), text
+
+
 def _claude_full(o, rows):
     """Every entry, tool calls and thinking included, for the view that asks
     for them. The conversation-only reader above drops these."""
+    q = _queued(o)
+    if q:
+        rows.append((q[0], strip_injected(q[1]) or q[1] if q[0] == "user" else q[1]))
+        return
     t = o.get("type")
     if t not in ("user", "assistant"):
         return
+    if o.get("isMeta"):
+        t = "env"                         # not typed; see _claude_rows
     msg = o.get("message") or {}
     content = msg.get("content")
     if isinstance(content, str):
-        rows.append(("user", strip_injected(content) or content))
+        rows.append((t, strip_injected(content) or content))
         return
     for b in content or []:
         bt = b.get("type")
@@ -4504,9 +5351,17 @@ def _claude_full(o, rows):
 
 def _claude_rows(o, rows, hidden):
     """One transcript line -> conversation rows. Returns the hidden count."""
+    q = _queued(o)
+    if q:
+        if q[0] != "user":
+            return hidden + 1             # a notice or a peer, not typed here
+        rows.append(("user", strip_injected(q[1]) or q[1]))
+        return hidden
     t = o.get("type")
     if t not in ("user", "assistant"):
         return hidden                     # bookkeeping, not conversation
+    if o.get("isMeta"):
+        return hidden + 1                 # injected into the user role
     msg = o.get("message") or {}
     content = msg.get("content")
     if isinstance(content, str):
@@ -4818,6 +5673,126 @@ def codex_quiet_for(cmd):
         return True
     return (time.time() - newest) > CODEX_QUIET_S
 
+CODEX_ASK_QUIET_S = 60
+
+
+def codex_awaiting(cmd):
+    return codex_pending(cmd) is not None
+
+
+def _call_text(pl):
+    """The command a codex call asks to run, readably: the cmd out of an
+    exec_command script, the argv of a shell call, else the raw input."""
+    raw = pl.get("input") or pl.get("arguments") or ""
+    if not isinstance(raw, str):
+        raw = json.dumps(raw)
+    m = _re.search(r'cmd:\s*"((?:[^"\\]|\\.)*)"', raw)
+    if m:
+        try:
+            return json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            return m.group(1)
+    o = _jobj(raw)
+    if isinstance(o, dict):
+        c = o.get("command") or o.get("cmd")
+        if isinstance(c, list):
+            return " ".join(str(x) for x in c)
+        if isinstance(c, str):
+            return c
+    return raw
+
+
+def codex_pending(cmd):
+    """{"command": ...} when the codex session's last act was to ask to run
+    a command and nothing has happened since, else None.
+
+    An approval prompt leaves no trace in the transcript but this: the
+    command call is the last thing written, with no output after it, and
+    the file goes quiet. That is readable here with no terminal open, which
+    nothing else about a codex prompt is. A session sat on one for hours reading
+    idle -- and the Enter after a message sent from the web view answered
+    it, "Yes, proceed", on the user's behalf.
+
+    A command that simply runs for over a minute without output looks the
+    same; holding a message back from it until it finishes is the safe side
+    to be wrong on."""
+    want = _codex_cwd(cmd)
+    if not want:
+        return None
+    rec = max((x for x in codex_files(40) if x.get("cwd") == want),
+              key=lambda x: x.get("mt", 0), default=None)
+    if not rec or time.time() - rec.get("mt", 0) < CODEX_ASK_QUIET_S:
+        return None
+    p = _codex_path(rec["file"])
+    if p is None:
+        return None
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as fh:
+            fh.seek(max(0, size - (256 << 10)))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        o = _jobj(line)
+        if not isinstance(o, dict):
+            continue
+        pl = o.get("payload") or {}
+        t = pl.get("type")
+        if o.get("type") == "event_msg" and t in ("task_complete", "turn_aborted"):
+            return None
+        if o.get("type") != "response_item":
+            continue
+        if t in ("function_call", "custom_tool_call", "local_shell_call"):
+            return {"command": _call_text(pl)[:2000]}
+        return None
+    return None
+
+
+def session_ask(name):
+    """What the web view shows above its message box: is the session
+    working, idle, or waiting for the person -- and if codex is waiting to
+    run a command, which one. A question the transcript does not record
+    cannot be answered by someone who is never shown it."""
+    card = name[:-len(SUFFIX)] if SUFFIX and name.endswith(SUFFIX) else name
+    if card in FOLDERS:
+        cc, _ = waiting_for(card, FOLDERS[card])
+        state = {"waiting": "waiting", "idle": "idle"}.get(cc, "working" if cc else "idle")
+        return {"kind": "claude", "state": state, "command": None,
+                "text": ("Claude Code is asking a question in the terminal"
+                         if state == "waiting" else "")}
+    try:
+        cmd = (Path.home() / ".dtach" / (name + ".cmd")).read_text()
+    except OSError:
+        return {"kind": "", "state": "", "command": None, "text": ""}
+    pend = codex_pending(cmd)
+    said = screen_says(name)
+    if pend or replay_asking(name) or (said and said.get("asking")):
+        return {"kind": "codex", "state": "waiting",
+                "command": pend["command"] if pend else None,
+                "text": ("codex is asking to run a command" if pend
+                         else "codex is asking a question in the terminal")}
+    return {"kind": "codex", "state": "idle" if codex_quiet_for(cmd) else "working",
+            "command": None, "text": ""}
+
+
+# The keys codex's approval prompt takes. No Enter after any of them: the
+# letter is the answer.
+ANSWER_KEYS = {"yes": "y", "always": "p", "no": "\x1b"}
+
+
+def _codex_cwd(cmd):
+    """The folder a terminal definition runs in, for matching the sensor's
+    lines to this card."""
+    m = _re.search(r"cd\s+(\S+)", cmd or "")
+    if not m:
+        return ""
+    try:
+        return str(Path(m.group(1)).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError):
+        return ""
+
+
 def term_entries():
     """Codex terminals as list entries, alongside the Claude sessions.
 
@@ -4845,15 +5820,22 @@ def term_entries():
         quiet = codex_quiet_for(cmd)
         # An open tab may have seen the screen stop on a question. That beats
         # the transcript's silence, which cannot tell "finished" from "asked".
-        said = screen_says(n)
-        asking = bool(said and said.get("asking"))
+        said = screen_says(n) or {}
+        pend = codex_pending(cmd)
+        asking = bool(said.get("asking")) or replay_asking(n) or bool(pend)
+        # What the card says it is asking: the page's own words for it when a
+        # tab saw the screen, else the command the transcript says is waiting.
+        # Without a page there is no `said` -- reading it as one took the
+        # whole dashboard down the first time a codex waited unwatched.
+        question = said.get("text") or (("run: " + pend["command"]) if pend else "")
         out.append({
             "name": "term:" + n, "label": n, "kind": "codex",
             "state": "running" if (d / n).is_socket() else "stopped",
             "cc": "waiting" if asking else ("idle" if quiet else "busy"),
             "rc": False, "count": 0, "model": "", "link": "",
             "note": "",
-            "snip": (said.get("text") or cmd[:160]) if asking else cmd[:160],
+            "ask": ask_for(n, _codex_cwd(cmd), "waiting" if asking else ""),
+            "snip": (question or cmd)[:160] if asking else cmd[:160],
             "href": "t?name=" + n,
             "fw": len(slots_for(n)), "owes": reply_target(n),
         })
@@ -4864,13 +5846,13 @@ def saved_order():
     """The card order the last drag saved, or [] if nobody has dragged yet."""
     try:
         return list(json.loads(
-            (ROOT / "config.json").read_text()).get("card_order") or [])
+            CONFIG.read_text()).get("card_order") or [])
     except (OSError, ValueError):
         return []
 
 def favorites():
     try:
-        return list(json.loads((ROOT / "config.json").read_text()).get("favorites", []))
+        return list(json.loads(CONFIG.read_text()).get("favorites", []))
     except (OSError, ValueError, AttributeError, TypeError):
         return []                      # a config being rewritten under us
 
@@ -4887,7 +5869,7 @@ def set_favorite(name, on):
     leaves the position alone; the card simply rejoins the others where it
     now sits, rather than springing back somewhere you have to go and find.
     """
-    cfg = json.loads((ROOT / "config.json").read_text())
+    cfg = json.loads(CONFIG.read_text())
     favs = [f for f in cfg.get("favorites", []) if f != name]
     if on:
         favs.insert(0, name)
@@ -4895,15 +5877,233 @@ def set_favorite(name, on):
         if cfg.get("card_order"):
             cfg["card_order"] = [name] + order
     cfg["favorites"] = favs
-    write_private(ROOT / "config.json", json.dumps(cfg, indent=2) + "\n")
+    write_private(CONFIG, json.dumps(cfg, indent=2) + "\n")
     return favs
 
 
+# Answering a question nobody should have to answer.
+#
+# Only ever "no". roost will decline a command its policy denies, and will
+# never approve anything: the worst a mistake here can do is refuse work that
+# would have been allowed, which costs a retry and is visible on the card.
+# Everything else is left alone -- a destructive command, an unknown one, a
+# question that is not about a command at all.
+#
+# It is verified rather than assumed. Escape is the decline; if the session
+# has not left "waiting" a few seconds later, the keystroke did not mean what
+# we thought, and roost stops touching that session and says so.
+_ANSWERED = set()                 # (folder, command) roost has refused
+AUTO_DECLINE = bool(CFG.get("auto_decline"))
+DECLINE_MAX_PER_HOUR = int(CFG.get("auto_decline_per_hour", 6))
+_DECLINED = {}                    # call id -> when roost answered it
+_DECLINE_FAILED = {}              # session name -> why roost stopped trying
+_DECLINE_LOG = Path.home() / ".roost" / "guard.jsonl"
+
+
+def _decline_note(name):
+    return _DECLINE_FAILED.get(name, "")
+
+
+def _recent_declines(name):
+    now = time.time()
+    return sum(1 for (n, _), at in _DECLINED.items()
+               if n == name and now - at < 3600)
+
+
+def _log_decline(rec):
+    try:
+        _DECLINE_LOG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _DECLINE_LOG.exists() and _DECLINE_LOG.stat().st_size > (4 << 20):
+            _DECLINE_LOG.replace(_DECLINE_LOG.with_suffix(".jsonl.old"))
+        with _DECLINE_LOG.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def send_escape(name):
+    """The key that means "no" at a permission prompt, in both agents."""
+    if is_dtach(name):
+        _dtach_push_path(dtach_sock(name), "\x1b", newline=False)
+        return
+    tmux("send-keys", "-t", f"{name}:", "Escape")
+
+
+def waiting_for(name, path):
+    """(status, pending call) for a session, from its own record and the
+    sensor's line -- the two things roost can read without a screen."""
+    infos = claude_infos(name, path)
+    cc = infos[0].get("status", "") if infos else ""
+    return cc, pending_ask(str(path), waiting_since(infos))
+
+
+def _tell(name, path, reason):
+    """Say why, and confirm it was said.
+
+    A submitted line makes the session busy; text left in the composer does
+    not, which is the only readable difference between the two. Checking the
+    status before typing is not enough: a denied call hands control straight
+    back to the model, which can be working again before the keystrokes
+    land. The check therefore happens after, and a sentence that cannot be
+    confirmed is withdrawn rather than reported as delivered -- a log that
+    claims a delivery it did not make is worse than one that admits the
+    miss."""
+    type_into(name, "roost declined that automatically. " + reason)
+    for _ in range(8):                             # up to ~4 seconds
+        time.sleep(0.5)
+        infos = claude_infos(name, path)
+        cc = infos[0].get("status", "") if infos else ""
+        if cc and cc != "idle":
+            return "at its prompt"
+    clear_composer(name)
+    return "not told: it went back to work before the text landed"
+
+
+def try_decline(name, path):
+    """Answer one question, or explain why roost will not.
+
+    Returns a note for the card, or "" when there is nothing to say."""
+    if not AUTO_DECLINE:
+        return ""
+    cc, hit = waiting_for(name, path)
+    if name in _DECLINE_FAILED:
+        if cc != "waiting":
+            _DECLINE_FAILED.pop(name, None)        # it moved; try again later
+        return _decline_note(name)
+    if cc != "waiting" or not hit:
+        return ""
+    cmd, at, _ = hit
+    key = (name, cmd)
+    if key in _DECLINED:
+        return ""                                  # asked and answered
+    decision, rule, reason = guard.judge(guard.unwrap(cmd), guard.load_policy())
+    if decision != guard.DENY:
+        return ""                                  # not roost's to answer
+    if _recent_declines(name) >= DECLINE_MAX_PER_HOUR:
+        _DECLINE_FAILED[name] = "declined too often this hour — left for you"
+        return _DECLINE_FAILED[name]
+
+    was = waiting_since(claude_infos(name, path))
+    _DECLINED[key] = time.time()
+    _ANSWERED.add((str(Path(path).expanduser().resolve()), cmd))
+    send_escape(name)
+    moved = ""
+    moved_to = ""
+    for _ in range(16):                            # up to ~8 seconds
+        time.sleep(0.5)
+        infos = claude_infos(name, path)
+        cc2 = infos[0].get("status", "") if infos else ""
+        if cc2 != "waiting":
+            moved, moved_to = "left waiting (%s)" % (cc2 or "gone"), cc2
+            break
+        if waiting_since(infos) > was + 0.5:
+            moved = "stopped on the next question"
+            break
+    if not moved:
+        # The keystroke did not do what we believed. Stop, and say so: a
+        # second guess at a prompt we cannot read is how a session gets
+        # answered wrongly.
+        _DECLINE_FAILED[name] = "tried to decline and the session did not move"
+        _log_decline({"at": time.time(), "session": name, "rule": rule,
+                      "decision": "decline-failed", "cmd": cmd[:400]})
+        return _DECLINE_FAILED[name]
+
+    # It moved. Say why, so the next attempt is a better one rather than the
+    # same one -- but only to a session that is at its prompt. Text typed at
+    # a busy session lands in the composer and is read whenever the turn
+    # ends, which is not the same as being told, and text typed at a session
+    # sitting on another question answers that question instead.
+    said = ""
+    if moved_to == "idle":
+        said = _tell(name, path, reason)
+    else:
+        said = "not told: it was %s" % (moved_to or "on another question")
+    _log_decline({"at": time.time(), "session": name, "rule": rule,
+                  "decision": "declined", "moved": moved, "told": said,
+                  "cmd": cmd[:400]})
+    return "declined: %s" % rule
+
+
+WAITS = Path.home() / ".roost" / "waits.jsonl"
+_FOLDED = {"seen": set(), "at": 0.0}
+
+
+def fold_waits():
+    """One line per finished tool call, kept small enough to keep for good.
+
+    The raw event log rotates; this does not need to. A line is about 150
+    bytes, a busy day is a few hundred lines, and the file is capped anyway
+    -- a year of it is a few megabytes."""
+    rows = agent_events()
+    if not rows:
+        return
+    open_by = {}
+    out = []
+    for e in rows:
+        key = (e.get("session"), e.get("cwd"),
+               e.get("id") or ("%s\x00%s" % (e.get("tool"), e.get("cmd"))))
+        ev = e.get("event")
+        if ev == "PreToolUse":
+            open_by[key] = e
+        elif ev == "PostToolUse":
+            start = open_by.pop(key, None)
+            if not start:
+                continue
+            mark = "%s/%s" % (start.get("session"), start.get("at"))
+            if mark in _FOLDED["seen"]:
+                continue
+            _FOLDED["seen"].add(mark)
+            out.append({"cwd": start.get("cwd", ""), "tool": start.get("tool", ""),
+                        "cmd": (start.get("cmd") or "")[:200],
+                        "at": start.get("at", 0),
+                        "secs": round(max(0.0, e.get("at", 0) - start.get("at", 0)), 1),
+                        "ended": ev})
+    if len(_FOLDED["seen"]) > 5000:
+        _FOLDED["seen"] = set(list(_FOLDED["seen"])[-2000:])
+    if not out:
+        return
+    try:
+        WAITS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if WAITS.exists() and WAITS.stat().st_size > (4 << 20):
+            WAITS.replace(WAITS.with_suffix(".jsonl.old"))
+        with WAITS.open("a") as fh:
+            for r in out:
+                fh.write(json.dumps(r) + "\n")
+    except OSError:
+        pass
+
+
+def waiting_since(infos):
+    """When this session started waiting, in seconds, or 0."""
+    at = (infos[0].get("statusUpdatedAt") if infos else 0) or 0
+    try:
+        at = float(at)
+    except (TypeError, ValueError):
+        return 0
+    return at / 1000 if at > 1e11 else at          # some records are in ms
+
+
+def ask_for(name, path, cc, infos=()):
+    """The command a waiting session is waiting on, with how long it has
+    been waiting, or "" when nothing can be read."""
+    if cc != "waiting":
+        return ""
+    hit = pending_ask(str(path), waiting_since(infos))
+    if not hit:
+        return ""
+    cmd, at, more = hit
+    mins = max(0, int((time.time() - at) / 60))
+    return (cmd + (" · %dm" % mins if mins else "")
+            + (" · and %d more" % more if more else ""))
+
+
 def status_all():
+    fold_waits()
     out = []
     for n, path in FOLDERS.items():
         st = state_of(n)
         cc, rc, count, model, link, href = "", False, 0, "", "", ""
+        infos = []
         if st == "claude":
             infos = claude_infos(n, path)
             count = len(infos)
@@ -4929,7 +6129,8 @@ def status_all():
         out.append({"name": n, "label": n + SUFFIX, "state": st, "cc": cc, "rc": rc,
                     "count": count, "model": model, "link": link,
                     "kind": "claude", "href": href,
-                    "note": note_for(n, st),
+                    "note": note_for(n, st) or _decline_note(n),
+                    "ask": ask_for(n, path, cc, infos if st == "claude" else ()),
                     "snip": "" if st == "dead" else snippet(n)})
     for e in out:                      # what mail this session is holding
         e["fw"] = len(slots_for(e["label"]))
@@ -5037,6 +6238,11 @@ PAGE = """<!doctype html>
                    padding: .55rem .7rem; cursor: pointer; }
   #pagent button.on { background: #23304a; color: #cfe0ff; }
   .pfoot #pname { flex: 1 1 auto; min-width: 0; }
+  .pnewrow { display: flex; flex-wrap: wrap; gap: .4rem .8rem; align-items: center;
+             padding: .45rem 0 0; font-size: .85rem; }
+  #pnew { background: none; border: 1px solid #3a5a9a; color: #cfe0ff;
+          border-radius: 6px; padding: .3rem .6rem; font: inherit; }
+  #pnew.on { background: #23304a; }
   .pfoot button { background: #23304a; border: 1px solid #3a5a9a; color: #cfe0ff;
                   border-radius: 9px; padding: .55rem .8rem; font: inherit;
                   cursor: pointer; }
@@ -5127,6 +6333,9 @@ PAGE = """<!doctype html>
   .row > .start { min-width: 6.5rem; color: #f3d9c4; background: #4a2e1c;
          border: 1px solid #43434c; }
   .row > .copy:active { background: #34343c; }
+  .row > .stop { color: #d8d8dc; background: #26262c; border: 1px solid #43434c; }
+  .row > .stop.arm { background: #8a2f22; border-color: #c05a45; color: #fff; }
+  .row > .stop:disabled { opacity: .35; cursor: default; }
   #msg { min-height: 1.4rem; color: #9a9aa0; font-size: .85rem; }
   /* On a phone the two labels ate ~150px of a 390px screen laid out
      horizontally, squeezing the card until its caption wrapped to three
@@ -5200,6 +6409,11 @@ PAGE = """<!doctype html>
            autocomplete="off" spellcheck="false">
     <div id="pwhere"></div>
     <div id="plist"></div>
+    <div class="pnewrow">
+      <button id="pnew" type="button">+ new repository</button>
+      <label id="ptmpll" hidden><input type="checkbox" id="ptmpl" checked>
+        CLAUDE.md from template</label>
+    </div>
     <div class="pfoot">
       <span id="pagent" role="group" aria-label="which agent">
         <button id="pclaude" type="button" class="on">Claude Code</button>
@@ -5232,7 +6446,8 @@ function describe(s) {
   // "waiting" is Claude Code's word for a modal it cannot pass; say what it
   // means, since the card is purple and the reason should be readable.
   if (s.cc === "waiting")
-    return "stopped on a question — answer it in the terminal"
+    return (s.ask ? "asking: " + s.ask : "stopped on a question")
+         + " — answer it in the terminal"
          + (s.model ? " · " + s.model : "");
   return (s.cc || "running")
        + (s.model ? " · " + s.model : "")
@@ -5527,6 +6742,7 @@ function render(sessions) {
     armHold(row, card);
     row.appendChild(card);
     row.appendChild(startButton(s, card));
+    row.appendChild(stopButton(s));
     list.appendChild(row);
   }
 }
@@ -5586,6 +6802,46 @@ function startButton(s, card) {
     }
     lastState = before;
     setTimeout(refresh, 1500);
+  };
+  return b;
+}
+
+// Stop, beside Start. Two taps, like a restart: the first says "stop?", the
+// second within five seconds does it. The session goes down; its definition
+// stays, and Start brings it back on the same conversation. Nothing is typed
+// into it, so a question on screen is not answered by stopping.
+function stopButton(s) {
+  const b = document.createElement("button");
+  b.className = "stop";
+  b.type = "button";
+  b.textContent = "stop";
+  const down = s.kind === "codex" ? s.state !== "running" : s.state === "dead";
+  if (down) { b.disabled = true; b.title = "not running"; }
+  let armed = false, disarm = null;
+  const reset = () => { armed = false; b.classList.remove("arm"); b.textContent = "stop"; };
+  b.onclick = async (e) => {
+    e.stopPropagation();
+    if (b.disabled) return;
+    if (!armed) {
+      armed = true;
+      b.classList.add("arm");
+      b.textContent = "stop?";
+      clearTimeout(disarm);
+      disarm = setTimeout(reset, 5000);
+      return;
+    }
+    clearTimeout(disarm); reset();
+    const msg = document.getElementById("msg");
+    const label = s.label || s.name;
+    b.textContent = "…";
+    msg.textContent = label + ": stopping…";
+    try {
+      const r = await fetch("api/stop?name=" + encodeURIComponent(s.name), { method: "POST" });
+      const j = await r.json();
+      msg.textContent = label + ": " + (j.result || j.error);
+    } catch (err) { msg.textContent = label + ": " + err; }
+    b.textContent = "stop";
+    setTimeout(refresh, 1200);
   };
   return b;
 }
@@ -5678,8 +6934,34 @@ function ptree(nodes, depth, into, term) {
   return into.childElementCount > 0;
 }
 
+// New repository: the selected folder is the parent -- the root when none
+// is, and a folder need not be a repository to be one -- and the name field
+// names the repository rather than a card for something that exists.
+let pNew = false;
+const pnew = document.getElementById("pnew");
+const ptmpl = document.getElementById("ptmpl");
+const ptmpll = document.getElementById("ptmpll");
+function pnewmode(on) {
+  pNew = on;
+  pnew.classList.toggle("on", on);
+  ptmpll.hidden = !on;
+  pname.placeholder = on ? "new repository name" : "card name";
+  pname.value = on ? "" : (pSelNode ? pSelNode.name : "");
+  pact();
+}
+pnew.onclick = () => pnewmode(!pNew);
+pname.oninput = () => { if (pNew) pact(); };
+
 function pact() {
   const what = pAgent === "codex" ? "codex" : "Claude Code";
+  if (pNew) {
+    const nm = pname.value.trim();
+    const where = pSelNode ? pSelNode.name : (pRoot.split("/").pop() || pRoot);
+    pgo.disabled = !nm;
+    pgo.textContent = nm ? "create " + nm + " in " + where + ", start " + what
+                         : "name the new repository";
+    return;
+  }
   if (!pSelNode) { pgo.disabled = true; pgo.textContent = "choose a repository"; return; }
   // "has a card" is about a Claude session in that folder; a codex terminal
   // beside it is an ordinary thing to want, so only Claude Code is refused.
@@ -5690,9 +6972,12 @@ function pact() {
 }
 
 function psel(n) {
+  if (pNew && n.path === pSel) {            // tap again: back to the root
+    pSel = ""; pSelNode = null; pact(); pdraw(); return;
+  }
   pSel = n.path;
   pSelNode = n;
-  pname.value = n.name;
+  if (!pNew) pname.value = n.name;
   pact();
   pdraw();
 }
@@ -5750,13 +7035,14 @@ let pTimer = 0;
 pq.oninput = () => { clearTimeout(pTimer); pTimer = setTimeout(pdraw, 120); };
 
 pgo.onclick = async () => {
-  if (!pSelNode) return;
+  if (!pSelNode && !pNew) return;
   pgo.disabled = true;
-  pmsg.textContent = "starting\u2026";
+  pmsg.textContent = pNew ? "creating\u2026" : "starting\u2026";
   try {
-    const r = await fetch("api/session?path=" + encodeURIComponent(pSel)
+    const r = await fetch("api/session?path=" + encodeURIComponent(pNew ? (pSel || pRoot) : pSel)
                           + "&name=" + encodeURIComponent(pname.value.trim())
-                          + "&agent=" + pAgent,
+                          + "&agent=" + pAgent
+                          + (pNew ? "&create=1&template=" + (ptmpl.checked ? 1 : 0) : ""),
                           { method: "POST" });
     const j = await r.json();
     if (j.error) { pmsg.textContent = j.error; pgo.disabled = false; return; }
@@ -5772,6 +7058,7 @@ document.getElementById("new").onclick = () => {
   pq.value = "";
   pSel = ""; pSelNode = null;
   pagent(pAgent);
+  pnewmode(false);
   pload();
 };
 document.getElementById("pclose").onclick = () => { picker.hidden = true; };
@@ -6539,6 +7826,11 @@ __INTER__
   :root { color-scheme: dark; }
   html, body { height: 100%; margin: 0; background: var(--c-bg); color: var(--c-text);
                font: 14px/1.45 system-ui, sans-serif; }
+  /* Chrome on Android reloads a page when a drag down at its top has
+     nothing left to scroll. In a terminal that is never wanted, and with a
+     program owning the screen it is every thumb-down: the reload looked
+     like the terminal refreshing itself instead of scrolling back. */
+  html, body { overscroll-behavior: none; }
   body { display: flex; flex-direction: column; }
   header { flex: none; display: flex; align-items: center; gap: .5rem .7rem;
            flex-wrap: wrap; padding: .45rem .7rem;
@@ -6556,8 +7848,94 @@ __INTER__
            border-radius: 999px; padding: .3rem .7rem; }
   /* Tabs, not a split: on a phone two panes at once left neither one usable.
      Both fill the page and only one is shown at a time. */
-  #hist { flex: 1 1 auto; overflow-y: auto; padding: .5rem .6rem; }
+  #hist { flex: 1 1 auto; overflow-y: auto; padding: .5rem .6rem;
+          overscroll-behavior: contain;
+          transition: transform .3s cubic-bezier(.2,.85,.25,1); }
+  #hist.roost-pull { transition: none; }      /* follow the finger, no easing */
+  /* The message box under the transcript. A flex item rather than fixed,
+     so the transcript above it stops where it starts; --kb lifts it over a
+     phone keyboard that covers the page without resizing it. */
+  #say { flex: none; border-top: 1px solid var(--c-line); background: var(--c-bg);
+         padding: .45rem .6rem calc(.45rem + env(safe-area-inset-bottom));
+         margin-bottom: var(--kb, 0px); }
+  #say > * { max-width: 46rem; margin-inline: auto; }
+  body.mid #say > * { max-width: 64rem; }
+  body.wide #say > * { max-width: none; }
+  .sayrow { display: flex; gap: .45rem; align-items: flex-end; }
+  #saytext { flex: 1 1 auto; min-width: 0; max-height: 40vh; resize: none;
+             box-sizing: border-box;   /* so scrollHeight + border is the height */
+             font: 15px/1.4 var(--c-font); color: var(--c-text);
+             background: var(--c-raised); border: 1px solid var(--c-line-strong);
+             border-radius: 10px; padding: .5rem .65rem; }
+  #saytext:focus { outline: none; border-color: var(--c-accent); }
+  #saysend, #sayattach, #saypaste { flex: none; padding: .5rem .8rem; border-radius: 10px;
+                                    font-size: .85rem; }
+  #sayattach, #saypaste { display: inline-flex; align-items: center; gap: .25rem;
+                          padding: .5rem .6rem; }
+  #saypaste[hidden] { display: none; }
+  #sayattach.has { color: var(--c-accent); border-color: var(--c-accent); }
+  #saysend { background: var(--c-accent); color: #0b1a2a; border: 0; }
+  #saysend:disabled { opacity: .45; cursor: default; }
+  #sayimgs { display: flex; flex-wrap: wrap; gap: .4rem; }
+  #sayimgs:empty { display: none; }
+  #sayimgs .chip { position: relative; margin-bottom: .45rem; }
+  #sayimgs img { height: 56px; border-radius: 6px; display: block;
+                 border: 1px solid var(--c-line-strong); }
+  #sayimgs .chip button { position: absolute; top: -6px; right: -6px; padding: 0 .35rem;
+                          border-radius: 999px; font-size: .75rem; line-height: 1.3; }
+  #cog { display: inline-flex; align-items: center; justify-content: center;
+         padding: .3rem .45rem; }
+  #cog.on { color: var(--c-accent); border-color: var(--c-accent); }
+  #opts { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .3rem .8rem; }
+  #askbar { margin-bottom: .4rem; font-size: .8rem; }
+  #askstate { color: var(--c-muted); }
+  #askbar.waiting #askstate { color: var(--c-clay); font-weight: 600; font-size: .9rem; }
+  #askcmd { display: block; margin: .3rem 0; padding: .4rem .55rem; border-radius: 8px;
+            background: var(--c-deep); border: 1px solid var(--c-line-strong);
+            font: 12.5px/1.4 var(--c-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+            max-height: 30vh; overflow-y: auto; }
+  #askbtns { display: flex; gap: .4rem; flex-wrap: wrap; }
+  #askbtns button, #askterm { padding: .45rem .8rem; border-radius: 8px; font-size: .85rem; }
+  #askyes { background: var(--c-accent); color: #0b1a2a; border: 0; }
+  #saymsg { font-size: .8rem; color: var(--c-muted); }
+  #saymsg:empty { display: none; }
+  #saymsg.bad { color: var(--c-clay); }
+  .toast { position: fixed; right: 12px; bottom: 12px; z-index: 70;
+           padding: .35rem .7rem; border-radius: 8px; background: #26262c;
+           color: var(--c-text); border: 1px solid var(--c-line-strong);
+           font-size: .85rem; box-shadow: 0 6px 20px rgba(0,0,0,.45); }
+  /* Sent from the box and not yet in the transcript: the writer's side of a
+     chat, right-aligned in the reading column, until the agent records it. */
+  /* Selectors carry #hist:not(.x) and .e so they outrank the reading view's
+     "#hist:not(.detailed) .user", which otherwise put them back on the left. */
+  #hist:not(.none) .e.user.pending { width: fit-content; max-width: min(85%, 40rem);
+                        margin: .5rem max(0px, calc((100% - 46rem) / 2)) .5rem auto;
+                        background: none; opacity: .85; }
+  body.mid #hist:not(.none) .e.user.pending { margin-right: max(0px, calc((100% - 64rem) / 2)); }
+  body.wide #hist:not(.none) .e.user.pending { margin-right: 0; }
+  #hist:not(.none) .e.user.pending .md { background: var(--c-raised); border-radius: 10px;
+                            border: 1px dashed var(--c-line-strong); padding: .45rem .7rem; }
+  /* Passed over: a later message got in and this one never did. */
+  #hist .e.user.pending.lost { opacity: .6; cursor: pointer; }
+  #hist .e.user.pending.lost .md { border-color: var(--c-clay); text-decoration: line-through;
+                                   text-decoration-color: rgba(217,119,87,.6); }
+  #hist .e.user.pending.lost::before { content: "not received · send it again · tap to dismiss";
+                                       color: var(--c-clay); }
+  #hist .e.user.pending::before { content: "queued"; display: block; text-align: right;
+                                font-size: .7rem; color: var(--c-muted); margin-bottom: .15rem; }
+  #hist .e.user.pending.sending::before { content: "sending…"; }
   #term { flex: 1 1 auto; border: 0; width: 100%; display: block; }
+  /* Behind the web view the terminal stays laid out at the size it will
+     have when shown -- the whole area under the header -- only invisible.
+     Hidden with display:none it measured 0x0, told the session it was two
+     columns by one row, squeezed the program to that while the web view
+     was being read, and had to resize and wait for a redraw when its tab
+     was opened. */
+  /* An explicit height: an iframe is a replaced element, so top and bottom
+     alone leave it at its default 150px -- nine rows, still a resize. */
+  #term.behind { position: fixed; left: 0; right: 0; top: var(--hdr, 3rem);
+                 width: 100%; height: calc(100% - var(--hdr, 3rem));
+                 visibility: hidden; pointer-events: none; z-index: -1; }
   .gone { display: none !important; }
   /* The reading widths, as in the document viewer: a conversation is prose
      too, and a line that runs the whole of a wide window is as hard to
@@ -6769,25 +8147,31 @@ __INTER__
   .asst { background: #14211a; border-color: #2a4a35; }
   .tool { background: #201a12; border-color: #4a3a22; }
   .out  { background: #101014; border-color: #26262e; color: #b6b6c0; }
+
+  /* The terminal's own right-click menu. The browser's would show a Copy
+     that does nothing: with the webgl renderer there is no DOM selection
+     for it to act on, however much text xterm is holding. */
 </style></head><body>
 <header>
   __HOMELINK__
   <span class="n">@__NAME__</span>
-  <button id="tterm" class="tab on" type="button">terminal</button>
-  <button id="thist" class="tab" type="button">history</button>
-  <button id="copy" type="button" title="copy what is selected in the terminal">copy</button>
-  <button id="shot" type="button" title="send a picture to this session">img</button>
-  <input id="shotfile" type="file" accept="image/*" hidden>
+  <button id="thist" class="tab on" type="button">web</button>
+  <button id="tterm" class="tab" type="button">terminal</button>
   <button id="diag" type="button" title="terminal state / send a trace">·</button>
   <button id="exp" class="gone" type="button">expand all</button>
   <button id="ess" class="gone" type="button">essential</button>
   <button id="col" class="gone" type="button">collapse all</button>
-  <label id="noiselab" class="gone"><input type="checkbox" id="detailed">
-    detailed</label>
-  <label id="noiselab2" class="gone"><input type="checkbox" id="noise">
-    tool calls</label>
-  <label id="noiselab3" class="gone"><input type="checkbox" id="mdbox" checked>
-    render as .md</label>
+  <!-- The web view's options, behind a cog: three checkboxes in the bar took
+       a whole line on a phone for settings nobody changes often. -->
+  <button id="cog" class="gone" type="button" title="view options"
+          aria-label="view options" aria-expanded="false"><svg viewBox="0 0 24 24"
+          width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+  <span id="opts" class="gone">
+    <label id="noiselab"><input type="checkbox" id="detailed"> detailed</label>
+    <label id="noiselab2"><input type="checkbox" id="noise"> tool calls</label>
+    <label id="noiselab3"><input type="checkbox" id="mdbox" checked> render as .md</label>
+  </span>
   __HIST__
   <button id="replybtn" class="gone" type="button"></button>
   <select id="toslot" title="forward this session's last answer">
@@ -6797,7 +8181,7 @@ __INTER__
   <span id="link" class="gone">reconnecting…</span>
 </header>
 <div id="slots"></div>
-<div id="pull"><span>pull for history</span></div>
+<div id="pull"><span>start of scrollback</span></div>
 <button id="toend" class="gone" type="button">↓ live</button>
 <div id="paused" class="gone"><div>
   <b>paused</b>
@@ -6809,11 +8193,119 @@ __INTER__
      by our own claim. -->
 <iframe id="term" data-src="term/?arg=__NAME__" title="__NAME__"></iframe>
 <div id="hist" class="gone">loading conversation…</div>
+<form id="say" class="gone" autocomplete="off">
+  <!-- What the session is doing, and the question it is waiting on: codex
+       records neither in its transcript, so this is the only place the web
+       view can show them. -->
+  <div id="askbar">
+    <div id="askstate"></div>
+    <code id="askcmd" class="gone"></code>
+    <div id="askbtns" class="gone">
+      <button id="askyes" type="button">Yes, run it</button>
+      <button id="askalways" type="button" title="and don't ask again for this command">Always</button>
+      <button id="askno" type="button">No</button>
+    </div>
+    <button id="askterm" type="button" class="gone">Answer in the terminal</button>
+  </div>
+  <div id="sayimgs"></div>
+  <div class="sayrow">
+    <button id="sayattach" type="button" title="attach a picture"
+            aria-label="attach a picture"><svg viewBox="0 0 24 24" width="18" height="18"
+            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+            stroke-linejoin="round" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg><span id="saycount"></span></button>
+    <button id="saypaste" type="button" hidden title="paste a picture from the clipboard"
+            aria-label="paste a picture from the clipboard"><svg viewBox="0 0 24 24" width="18"
+            height="18" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg></button>
+    <input id="sayfile" type="file" accept="image/*" multiple hidden>
+    <!-- A textarea, deliberately. An editable div was tried so a phone
+         keyboard could insert pictures, but Chrome only allows that behind
+         a flag, and the div broke Android keyboard composition: each
+         half-typed word was committed again, "i in inc inco ...". -->
+    <textarea id="saytext" rows="2" spellcheck="true"
+              aria-label="message to @__NAME__"></textarea>
+    <button id="saysend" type="submit">Send</button>
+  </div>
+  <div id="saymsg" aria-live="polite"></div>
+</form>
 <script>
 // The transcript comes from codex's rollout file, so it is the real
 // conversation rather than terminal scrollback — which dtach does not keep.
 const FILE = __FILE__;
 const hist = document.getElementById("hist");
+const sayForm = document.getElementById("say");
+// Messages sent from the box, shown until the transcript has them. An agent
+// records a message when it takes it, and a busy one holds a queued message
+// for as long as it works -- so "the transcript grew" says nothing, and
+// dropping them on that was how they vanished. They stay until a user turn
+// in the transcript carries their text; the server keeps them too, so a
+// reload or another device shows them as well.
+let sayPending = [];                   // {text, images, t, el}
+// What the transcript recorded since the oldest of them, with times: the
+// evidence that settles each one. Matched by text alone, a message stayed
+// queued forever when the agent never recorded it (an approval prompt
+// swallowed it) or recorded it a little differently (a line break inside a
+// word).
+let userTurns = [];
+// Text compared with every space and line break taken out: "loop" recorded
+// with a line break after its "l" is still "loop" to whoever typed it.
+const saySquash = (s) => (s || "").replace(/\\s+/g, "").toLowerCase();
+// recorded: the transcript has it. lost: a later message got in and this
+// one never did -- the agent did not take it, so say so rather than keep
+// promising it. queued: neither yet.
+//
+// Equal, not contained: "go" is inside half the messages anyone sends, and
+// matching by containment cleared a "go" the moment it was sent, so it
+// showed nowhere until the agent got round to recording it. And each
+// recorded message settles one queued message only, oldest first, so two
+// "go"s in a row are two messages. A picture's message is recorded with the
+// picture's path in front, so its text is compared as the ending.
+// A recorded message that settled one stays spent: the second "go" must not
+// be cleared by the first one's record.
+const spentTurns = new Set();
+const turnId = (u) => u.t + "|" + u.text;
+function sayFates() {
+  const fate = new Map();
+  for (const p of [...sayPending].sort((a, b) => a.t - b.t)) {
+    if (p.sending) continue;
+    const key = saySquash(p.text);
+    const u = userTurns.find((u) => !spentTurns.has(turnId(u)) && u.t >= p.t - 30 && (
+      !key || (p.images.length ? saySquash(u.text).endsWith(key) : saySquash(u.text) === key)));
+    if (u) { spentTurns.add(turnId(u)); fate.set(p, "recorded"); continue; }
+    fate.set(p, userTurns.some((u) => !spentTurns.has(turnId(u)) && u.t > p.t + 5) ? "lost" : "queued");
+  }
+  return fate;
+}
+async function refreshTurns() {
+  if (!FILE || !sayPending.length) return;
+  const since = Math.min(...sayPending.map((p) => p.t)) - 60;
+  try {
+    const j = await (await fetch("api/userturns?file=" + encodeURIComponent(FILE)
+                                 + "&since=" + since)).json();
+    if (j.turns) userTurns = j.turns;
+  } catch (e) {}
+}
+const DISMISSED = "roost-dismissed-" + "__NAME__";
+function dismissedSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(DISMISSED) || "[]")); }
+  catch (e) { return new Set(); }
+}
+function showPending() {
+  hist.querySelectorAll(".user.pending").forEach((e) => e.remove());
+  const gone = dismissedSet();
+  const fates = sayFates();
+  sayPending = sayPending.filter((p) => {
+    p.el.classList.toggle("sending", !!p.sending);
+    if (p.sending) return true;          // on its way; shown at once
+    const fate = fates.get(p);
+    if (fate === "recorded") return false;
+    if (gone.has(Math.round(p.t))) return false;
+    p.el.classList.toggle("lost", fate === "lost");
+    return true;
+  });
+  sayPending.forEach((p) => hist.appendChild(p.el));
+}
+function settlePending() { refreshTurns().then(showPending); }
 const meta = document.getElementById("meta");
 // A path in a transcript opens in a window of its own. This tab is the
 // session — the terminal is live in it — and following a file link out of
@@ -6833,6 +8325,10 @@ hist.addEventListener("scroll", () => {
   atBottom = hist.scrollTop + hist.clientHeight >= hist.scrollHeight - 40;
 });
 const PAGE = 150;            // messages pulled per scroll-up
+const QUICK = 30;            // the first load: a screenful
+// Resolved once the web view first has something on it.
+let firstPaintDone;
+const firstPaint = new Promise((r) => { firstPaintDone = r; });
 // An ABSOLUTE index into the transcript, not "the last N". Requesting the tail
 // meant every new entry pushed an old one off the top — history visibly
 // vanished as soon as you typed. Anchored here, new entries extend the view
@@ -6843,7 +8339,12 @@ let more = 0, loadingOlder = false;
 let lastTotal = -1;
 
 async function tick(force) {
-  if (!FILE) { hist.innerHTML = "<em>no transcript for this session</em>"; return; }
+  if (!FILE) {
+    hist.innerHTML = "<em>no transcript for this session</em>";
+    firstPaintDone();
+    showPending();          // a new session's messages still show, queued
+    return;
+  }
   // The transcript is half a megabyte of HTML; rebuilding it on a timer while
   // the tab is hidden was stealing frames from the terminal next to it.
   if (!force && hist.classList.contains("gone")) return;
@@ -6855,7 +8356,11 @@ async function tick(force) {
       const cj = await c.json();
       if (cj.total === lastTotal) return;
     }
-    const q = ((first === null) ? "&items=" + PAGE
+    // The first load asks for a screenful, not a window: 30 items fill a
+    // phone, and arrive in a sixth of the time 150 did on a slow link. The
+    // rest of the window follows in the background, through older(), which
+    // keeps whatever is on screen where it is.
+    const q = ((first === null) ? "&items=" + QUICK
                                : "&from=" + first + "&items=100000")
               + "&md=" + (mdBox.checked ? "1" : "0") + convArg();
     const r = await fetch("api/codex?file=" + encodeURIComponent(FILE) + q);
@@ -6871,10 +8376,16 @@ async function tick(force) {
     typeset(hist);
     applyDetailed();   // the reading view re-opens what the refresh replaced
     applyAll();        // an explicit expand/collapse survives the refresh
+    showPending();     // at once, so they do not blink out
+    settlePending();   // then against what the transcript recorded
     // First load lands on the tail; remember where that window starts so
     // every later poll asks for the same anchor onwards.
     lastTotal = j.total || 0;
-    if (first === null) first = Math.max(0, (j.total || 0) - PAGE);
+    if (first === null) {
+      first = Math.max(0, (j.total || 0) - QUICK);
+      firstPaintDone();
+      if (first > 0) setTimeout(older, 0);    // the rest of the window, behind it
+    }
     more = (j.from !== null && j.from !== undefined) ? j.from : (j.more || 0);
     const hid = hist.querySelectorAll('.e[data-k="tool"], .e[data-k="out"],'
                                      + ' .e[data-k="env"]').length;
@@ -6976,9 +8487,19 @@ function syncControls() {
   const onTerm = hist.classList.contains("gone");
   for (const el of [expBtn, colBtn, document.getElementById("ess")])
     el.classList.toggle("gone", onTerm || !detBox.checked);
-  for (const id of ["noiselab", "noiselab2", "noiselab3"])
-    document.getElementById(id).classList.toggle("gone", onTerm);
+  // The options live behind the cog, and both belong to the web view only.
+  const cog = document.getElementById("cog");
+  cog.classList.toggle("gone", onTerm);
+  document.getElementById("opts").classList.toggle(
+    "gone", onTerm || cog.getAttribute("aria-expanded") !== "true");
 }
+document.getElementById("cog").addEventListener("click", () => {
+  const cog = document.getElementById("cog");
+  const open = cog.getAttribute("aria-expanded") !== "true";
+  cog.setAttribute("aria-expanded", open ? "true" : "false");
+  cog.classList.toggle("on", open);
+  syncControls();
+});
 
 // Terminal and history are two views of the same session, one at a time.
 // Terminal is the default: this page exists to type into codex, and the
@@ -6990,33 +8511,53 @@ const tabHist = document.getElementById("thist");
 const expBtn = document.getElementById("exp");
 const colBtn = document.getElementById("col");
 
+var termReady = false;       // var: read by show() before the script reaches it
+window.addEventListener("resize", () => {
+  document.body.style.setProperty("--hdr",
+    Math.round(document.querySelector("header").getBoundingClientRect().bottom) + "px");
+});
 function show(which) {
   const t = which === "term";
   // The tab lives in the URL, so a refresh, a bookmark or a link back comes
-  // up on the view you were reading rather than on the terminal.
+  // up on the view you were reading. The web view is the default, so only
+  // the terminal is written down.
   try {
     const u = new URL(window.location);
-    if (t) u.searchParams.delete("tab");
-    else u.searchParams.set("tab", "hist");
+    if (t) u.searchParams.set("tab", "term");
+    else u.searchParams.delete("tab");
     history.replaceState(null, "", u);
   } catch (e) { /* not fatal */ }
-  term.classList.toggle("gone", !t);
+  // Never display:none -- see #term.behind. Its top follows the header,
+  // which wraps to a different height on a phone than on a desktop.
+  document.body.style.setProperty("--hdr",
+    Math.round(document.querySelector("header").getBoundingClientRect().bottom) + "px");
+  term.classList.toggle("behind", !t);
   hist.classList.toggle("gone", t);
+  sayForm.classList.toggle("gone", t);
   tabTerm.classList.toggle("on", t);
   tabHist.classList.toggle("on", !t);
   // expand/collapse act on the transcript, so they only belong to that tab.
   syncControls();
-  if (t) { termToEnd(); return; }
+  if (t) {
+    // Not during the first show(): that runs above the declarations
+    // startTerm reaches, and the end of the script starts it then anyway.
+    if (termReady) startTerm();
+    termToEnd();
+    return;
+  }
   tick(true).then(() => { if (atBottom) hist.scrollTop = hist.scrollHeight; });
+  if (termReady) pollAsk();          // the script has run past its declarations
 }
 tabTerm.onclick = () => show("term");
 tabHist.onclick = () => show("hist");
-const START = new URLSearchParams(location.search).get("tab") === "hist"
-            ? "hist" : "term";
+// A session opens on the web view; ?tab=term asks for the terminal. An old
+// ?tab=hist link lands on the web view all the same.
+const START = new URLSearchParams(location.search).get("tab") === "term"
+            ? "term" : "hist";
 // After the controls it reaches: syncControls() touches expBtn and colBtn,
 // which are const and would still be in the dead zone further up.
 applyDetailed();
-if (START === "hist") show("hist");     // ?tab=hist, from a refresh or a link
+show(START);
 
 // Scroll the terminal to the newest output. xterm.js keeps its own scrolling
 // viewport inside the iframe, so this reaches into that element directly
@@ -7307,6 +8848,20 @@ async function watchLink() {
   const wasDown = serverDown;
   lastServerId = j.id;
   serverDown = false;
+  // A different build is page code this open tab does not have. A deploy
+  // revives the terminal frame but never this script, so a phone kept
+  // running the old one -- a gesture already removed from the server still
+  // switching tabs -- until somebody thought to reload by hand. Reload,
+  // once per build: the draft is in storage and the tab is in the address.
+  if (j.build && j.build !== BUILD) {
+    let tried = "";
+    try { tried = sessionStorage.getItem("roost-reload-for") || ""; } catch (e) {}
+    if (tried !== j.build) {
+      try { sessionStorage.setItem("roost-reload-for", j.build); } catch (e) {}
+      location.reload();
+      return;
+    }
+  }
   // Stuck on ttyd's own dead end, whatever the server has been doing.
   const stuck = /Reconnect|Connection Closed/.test(termOverlayText());
   if (wasDown || restarted || stuck) {
@@ -7328,8 +8883,7 @@ watchLink();
 // though, and hands it over on request -- so copying is a thing this page
 // has to do, not something the browser can be left to.
 //
-// Select with the mouse as usual, then this button or Ctrl-Shift-C.
-const copyBtn = document.getElementById("copy");
+// Select with the mouse as usual, then Ctrl-Shift-C.
 
 function termSelection() {
   try {
@@ -7375,17 +8929,28 @@ async function copySelection() {
   }
 }
 
-let copyTimer = null;
+// Short notices ("copied 40 chars", "refreshing…") in a toast. They used to
+// rewrite the copy button's label; the button is gone from the bar.
+let toastEl = null, toastTimer = null;
 function flashCopy(msg) {
-  copyBtn.textContent = msg;
-  clearTimeout(copyTimer);
-  copyTimer = setTimeout(() => { copyBtn.textContent = "copy"; }, 1600);
+  if (!toastEl) {
+    toastEl = document.createElement("div");
+    toastEl.className = "toast";
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    if (toastEl) { toastEl.remove(); toastEl = null; }
+  }, 1800);
 }
-copyBtn.onclick = copySelection;
 
-// Ctrl-Shift-C inside the frame as well: the terminal has focus while you
-// are reading it, and reaching for a button to copy is the part that makes
-// people give up and retype.
+// Copying out of the terminal is keyboard-only, deliberately. Intercepting
+// presses -- so a plain drag would select while a program had the mouse, and
+// a right-click would offer Copy -- grabbed the compatibility mouse events a
+// phone's tap produces as well, and broke scrolling and focus on the phone
+// more than once. Select with shift-drag, which is what xterm documents for
+// a program that has the mouse, then Ctrl-C or Ctrl-Shift-C.
 function bindCopyKey(win) {
   try {
     const d = win && win.document;
@@ -7393,6 +8958,16 @@ function bindCopyKey(win) {
     d._roostCopyKey = true;
     d.addEventListener("keydown", (e) => {
       if (e.ctrlKey && e.shiftKey && (e.key === "C" || e.key === "c")) {
+        e.preventDefault();
+        e.stopPropagation();
+        copySelection();
+        return;
+      }
+      // Plain Ctrl-C copies when there is something to copy and interrupts
+      // when there is not. A terminal that always interrupts is correct and
+      // useless; one that always copies cannot stop a runaway program.
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey
+          && (e.key === "c" || e.key === "C") && termSelection()) {
         e.preventDefault();
         e.stopPropagation();
         copySelection();
@@ -7408,9 +8983,6 @@ function bindCopyKey(win) {
 // The image is uploaded instead, and its path typed into the session without
 // a newline -- the agent reads files, so a path is the form it can act on,
 // and you get to say what to do with it before pressing Enter.
-const shot = document.getElementById("shot");
-const shotFile = document.getElementById("shotfile");
-
 async function sendImage(file) {
   if (!file) return;
   flashCopy("sending picture…");
@@ -7446,6 +9018,9 @@ function handlePaste(ev) {
   if (!f) return;                       // text: xterm's business, not ours
   ev.preventDefault();
   ev.stopPropagation();
+  // On the history tab the picture belongs to the message being written,
+  // not straight into the terminal's composer.
+  if (!sayForm.classList.contains("gone")) { addPic(f); return; }
   sendImage(f);
 }
 
@@ -7461,12 +9036,6 @@ function bindPaste(win) {
   } catch (e) { return false; }
 }
 
-// A phone has no Ctrl-V worth the name: the button opens the camera roll.
-shot.onclick = () => shotFile.click();
-shotFile.onchange = () => {
-  sendImage(shotFile.files && shotFile.files[0]);
-  shotFile.value = "";                  // so the same picture can go twice
-};
 
 // --- telling the dashboard what this screen is showing -------------------
 // A codex session that has stopped to ask something looks exactly like one
@@ -7668,6 +9237,420 @@ function typeset(root) {
 }
 
 const BUILD = "__BUILD__", NAME = "__NAME__";
+
+// --- the message box under the transcript ------------------------------
+// Write to the session without the terminal: read the conversation, answer
+// under it. The server pastes it in as one block and presses Enter, and
+// refuses while the session is stopped on a question -- an Enter would
+// answer that, and the highlighted answer is usually yes.
+//
+// A desktop sends on Enter, with Shift+Enter for a new line, the way chat
+// boxes do. A phone's Enter is a new line and the button sends: there is
+// no Shift on a phone keyboard. Ctrl/Cmd+Enter sends on either.
+const sayText = document.getElementById("saytext");
+const saySend = document.getElementById("saysend");
+const sayImgs = document.getElementById("sayimgs");
+const sayMsgEl = document.getElementById("saymsg");
+const sayFile = document.getElementById("sayfile");
+const sayAttach = document.getElementById("sayattach");
+const COARSE = matchMedia("(pointer: coarse)").matches;
+const DRAFT = "roost-say-" + NAME;
+let sayPics = [];                       // {path, url} already stored
+sayText.placeholder = "message @" + NAME
+  + (COARSE ? "" : "  ·  Enter sends, Shift+Enter for a new line");
+sayText.setAttribute("enterkeyhint", COARSE ? "enter" : "send");
+const sayCount = document.getElementById("saycount");
+
+function sayNote(t, bad) {
+  sayMsgEl.textContent = t || "";
+  sayMsgEl.classList.toggle("bad", !!bad);
+}
+function sayVal() { return sayText.value; }
+// Grow with the text, from two lines up to the CSS cap. Only the height is
+// touched -- nothing in the box changes while a keyboard is composing.
+// Measured only while it is on screen: hidden -- the terminal tab, or the
+// page before its first paint -- scrollHeight is 0, and the box stayed 2px
+// tall until something was typed into it.
+function sayGrow() {
+  sayText.style.height = "auto";
+  if (sayText.scrollHeight) sayText.style.height = (sayText.scrollHeight + 2) + "px";
+}
+function sayReady() {
+  saySend.disabled = !(sayVal().trim() || sayPics.length);
+}
+function saveDraft() {
+  try { localStorage.setItem(DRAFT, sayVal()); } catch (e) {}
+}
+// A keyboard that inserts a picture into the box rather than pasting it
+// leaves an <img> behind. Take it out and attach it like any other.
+function dataToFile(src) {
+  const comma = src.indexOf(",");
+  const type = src.slice(5, src.indexOf(";")) || "image/png";
+  const bin = atob(src.slice(comma + 1));
+  return new File([Uint8Array.from(bin, (c) => c.charCodeAt(0))], "pasted",
+                  { type: type });
+}
+async function adoptSrc(src) {
+  try {
+    if (src.startsWith("data:image/")) addPic(dataToFile(src));
+    else if (src.startsWith("blob:")) {
+      const b = await (await fetch(src)).blob();
+      addPic(new File([b], "pasted", { type: b.type || "image/png" }));
+    }
+  } catch (e) { sayNote("could not take that picture", true); }
+}
+async function adoptImages() {
+  for (const im of [...sayText.querySelectorAll("img")]) {
+    const src = im.getAttribute("src") || "";
+    im.remove();
+    adoptSrc(src);
+  }
+}
+
+// Every form a pasted picture has been seen to take: a file, an image item
+// a browser does not call a file, and HTML carrying the picture inline.
+function pastedPictures(dt) {
+  const files = [...(dt.files || [])].filter((f) => (f.type || "").startsWith("image/"));
+  if (files.length) return { files: files, srcs: [] };
+  for (const it of [...(dt.items || [])]) {
+    if ((it.type || "").startsWith("image/")) {
+      const f = it.getAsFile && it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (files.length) return { files: files, srcs: [] };
+  const html = dt.getData("text/html") || "";
+  const srcs = html ? [...new DOMParser().parseFromString(html, "text/html")
+                         .querySelectorAll("img")]
+                      .map((i) => i.getAttribute("src") || "")
+                      .filter((s) => s.startsWith("data:image/") || s.startsWith("blob:"))
+                    : [];
+  return { files: [], srcs: srcs };
+}
+
+// What a paste into the box carried, for when a phone's paste still does
+// nothing: written to the trace so the next attempt says why.
+function tracePaste(dt, took) {
+  try {
+    fetch("api/trace", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: NAME, kind: "say-paste", build: BUILD, took: took,
+        ua: navigator.userAgent,
+        types: dt ? [...(dt.types || [])] : null,
+        items: dt ? [...(dt.items || [])].map((i) => i.kind + ":" + i.type) : null,
+        files: dt ? (dt.files || []).length : null }) });
+  } catch (e) {}
+}
+
+function drawPics() {
+  sayCount.textContent = sayPics.length ? String(sayPics.length) : "";
+  sayAttach.classList.toggle("has", sayPics.length > 0);
+  sayImgs.textContent = "";
+  sayPics.forEach((p, i) => {
+    const c = document.createElement("span");
+    c.className = "chip";
+    const im = document.createElement("img");
+    im.src = p.url;
+    im.alt = p.path.split("/").pop();
+    const x = document.createElement("button");
+    x.type = "button"; x.textContent = "×"; x.title = "remove";
+    x.onclick = () => {
+      URL.revokeObjectURL(p.url); sayPics.splice(i, 1); drawPics(); sayReady();
+    };
+    c.append(im, x);
+    sayImgs.appendChild(c);
+  });
+}
+
+// Stored now, sent with the message. Typing the path into the composer at
+// once -- what the terminal tab does -- would leave it there if the message
+// were never sent.
+async function addPic(file) {
+  if (!file || (file.type || "").indexOf("image/") !== 0) return;
+  sayNote("uploading picture…");
+  try {
+    const r = await fetch("api/paste?type=0&name=" + encodeURIComponent(NAME), {
+      method: "POST", headers: { "content-type": file.type },
+      body: await file.arrayBuffer() });
+    const j = await r.json();
+    if (!j.path) { sayNote(j.error || "could not upload", true); return; }
+    sayPics.push({ path: j.path, url: URL.createObjectURL(file) });
+    drawPics(); sayNote(""); sayReady();
+  } catch (e) { sayNote("could not upload", true); }
+}
+
+function echoEl(text) {
+  const d = document.createElement("div");
+  d.className = "e user pending";
+  const m = document.createElement("div");
+  m.className = "md";
+  m.style.whiteSpace = "pre-wrap";
+  m.textContent = text;
+  d.appendChild(m);
+  return d;
+}
+
+function pendingOf(r) {
+  const shown = (r.images || []).map((b) => "[image] " + b)
+    .concat(r.text ? [r.text] : [])
+    .join(String.fromCharCode(10));     // built: a \\n here would be Python's
+  const p = { text: r.text || "", images: r.images || [], t: r.t, el: echoEl(shown) };
+  // A message the agent never took can be tapped away; it stays gone on
+  // this device.
+  p.el.addEventListener("click", () => {
+    if (!p.el.classList.contains("lost")) return;
+    const s = dismissedSet();
+    s.add(Math.round(p.t));
+    try { localStorage.setItem(DISMISSED, JSON.stringify([...s].slice(-200))); } catch (e) {}
+    sayPending = sayPending.filter((x) => x !== p);
+    p.el.remove();
+  });
+  return p;
+}
+// A slash command is run by the agent, not recorded as something said, so
+// it would wait for a transcript entry that never comes.
+const queueable = (r) => !(r.text || "").trim().startsWith("/") || (r.images || []).length;
+// What this session was sent from the page, from the server's record: a
+// reload, or the same session open on another device, shows it too.
+async function loadSaid() {
+  try {
+    const j = await (await fetch("api/said?name=" + encodeURIComponent(NAME))).json();
+    const have = new Set(sayPending.map((p) => Math.round(p.t)));
+    for (const r of j.said || [])
+      if (queueable(r) && !have.has(Math.round(r.t))) sayPending.push(pendingOf(r));
+    sayPending.sort((a, b) => a.t - b.t);
+    if (!hist.classList.contains("gone")) { showPending(); settlePending(); }
+  } catch (e) {}
+}
+loadSaid();
+
+// Shown the moment it is sent, not when the server answers: the answer
+// waits out the pause before codex's Enter, and over a phone link that was
+// seconds of a message that seemed to have gone nowhere. So the box is free
+// again at once, and a second message sent meanwhile waits its turn here
+// rather than being refused or crossing the first on the way in.
+let sayChain = Promise.resolve();
+function saySubmit() {
+  const text = sayVal();
+  if (!(text.trim() || sayPics.length)) return;
+  const pics = sayPics;
+  const sent = { text: text.trim(), t: Date.now() / 1000,
+                 images: pics.map((p) => p.path.split("/").pop()) };
+  const mine = queueable(sent) ? pendingOf(sent) : null;
+  if (mine) {
+    mine.sending = true;
+    sayPending.push(mine);
+    showPending();
+    atBottom = true;
+    hist.scrollTop = hist.scrollHeight;
+  }
+  sayPics = []; drawPics();
+  sayText.value = ""; sayGrow(); saveDraft(); sayReady();
+  sayNote("sending…");
+  const unsend = (msg) => {
+    if (mine) { sayPending = sayPending.filter((x) => x !== mine); mine.el.remove(); }
+    if (!sayVal() && !sayPics.length) {
+      sayText.value = text; sayGrow(); saveDraft();
+      sayPics = pics; drawPics(); sayReady();
+    }
+    sayNote(msg, true);
+  };
+  sayChain = sayChain.then(async () => {
+    try {
+      const r = await fetch("api/say?name=" + encodeURIComponent(NAME), {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: text, images: pics.map((p) => p.path) }) });
+      const j = await r.json();
+      if (j.error) { unsend(j.error); return; }
+      if (mine) mine.sending = false;
+      showPending();
+      pics.forEach((p) => URL.revokeObjectURL(p.url));
+      sayNote("");
+      setTimeout(() => tick(), 1500);
+      setTimeout(() => tick(), 4000);
+    } catch (e) {
+      unsend("could not send: " + e);
+    }
+  });
+}
+
+sayForm.addEventListener("submit", (e) => { e.preventDefault(); saySubmit(); });
+sayText.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.isComposing) return;
+  if (e.ctrlKey || e.metaKey || (!COARSE && !e.shiftKey)) {
+    e.preventDefault();
+    saySubmit();
+  }
+});
+sayText.addEventListener("input", () => { sayGrow(); sayReady(); saveDraft(); });
+// A paste into the box. A picture in any form is attached; anything else is
+// the textarea's own paste, which is plain text already.
+sayText.addEventListener("paste", (e) => {
+  const dt = e.clipboardData;
+  if (e.defaultPrevented) { tracePaste(dt, "file"); return; }
+  if (!dt) { tracePaste(dt, "browser"); return; }
+  const p = pastedPictures(dt);
+  if (p.files.length || p.srcs.length) {
+    e.preventDefault();
+    p.files.forEach(addPic);
+    p.srcs.forEach(adoptSrc);
+    tracePaste(dt, "picture");
+    return;
+  }
+  tracePaste(dt, "text");
+});
+
+// Straight from the clipboard, for a phone whose keyboard will not hand a
+// picture to a web page at all. The browser asks once whether the page may
+// read the clipboard; only where it can be asked is the button shown.
+const sayPaste = document.getElementById("saypaste");
+if (navigator.clipboard && navigator.clipboard.read && window.isSecureContext) {
+  sayPaste.hidden = false;
+}
+sayPaste.addEventListener("click", async () => {
+  try {
+    let found = 0;
+    for (const item of await navigator.clipboard.read()) {
+      const type = item.types.find((t) => t.startsWith("image/"));
+      if (!type) continue;
+      const b = await item.getType(type);
+      addPic(new File([b], "pasted", { type: type }));
+      found++;
+    }
+    if (!found) sayNote("no picture on the clipboard", true);
+  } catch (e) {
+    sayNote("the clipboard could not be read: " + (e.message || e), true);
+  }
+});
+sayAttach.addEventListener("click", () => sayFile.click());
+sayFile.addEventListener("change", () => {
+  [...sayFile.files].forEach(addPic);
+  sayFile.value = "";
+});
+// A picture dragged onto the transcript or the box, on a desktop.
+for (const el of [hist, sayForm]) {
+  el.addEventListener("dragover", (e) => {
+    if ([...(e.dataTransfer && e.dataTransfer.items || [])]
+          .some((it) => it.kind === "file")) e.preventDefault();
+  });
+  el.addEventListener("drop", (e) => {
+    const fs = [...(e.dataTransfer && e.dataTransfer.files || [])]
+      .filter((f) => (f.type || "").indexOf("image/") === 0);
+    if (!fs.length) return;
+    e.preventDefault();
+    fs.forEach(addPic);
+  });
+}
+// A phone keyboard covers the page without resizing it, so the box would
+// sit under it. Lift the box by however much of the window is covered.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const lift = () => {
+    const h = Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop));
+    document.body.style.setProperty("--kb", h + "px");
+  };
+  vv.addEventListener("resize", lift);
+  vv.addEventListener("scroll", lift);
+}
+try { sayText.value = localStorage.getItem(DRAFT) || ""; } catch (e) {}
+sayGrow(); sayReady();
+
+// --- what the session is doing, and what it is asking -------------------
+// Above the box, always: working, idle, or waiting for you. When codex is
+// waiting to run a command, the command itself and the three answers its
+// prompt takes -- the same keys the terminal would send. The server checks
+// the prompt is still there before sending one.
+const askBar = document.getElementById("askbar");
+const askState = document.getElementById("askstate");
+const askCmd = document.getElementById("askcmd");
+const askBtns = document.getElementById("askbtns");
+const askTerm = document.getElementById("askterm");
+const ASK_WORDS = { working: "working…",
+                    idle: "idle — waiting for your next message" };
+async function pollAsk() {
+  if (sayForm.classList.contains("gone")) return;
+  let a = null;
+  try {
+    a = await (await fetch("api/ask?name=" + encodeURIComponent(NAME),
+                           { cache: "no-store" })).json();
+  } catch (e) { return; }
+  const waiting = a.state === "waiting";
+  const approval = waiting && a.kind === "codex" && !!a.command;
+  askBar.classList.toggle("waiting", waiting);
+  askState.textContent = waiting ? (a.text || "waiting for you")
+                                 : (ASK_WORDS[a.state] || "");
+  askCmd.textContent = a.command || "";
+  askCmd.classList.toggle("gone", !approval);
+  askBtns.classList.toggle("gone", !approval);
+  askTerm.classList.toggle("gone", !waiting || approval);
+}
+async function answer(choice) {
+  try {
+    const r = await fetch("api/answer?name=" + encodeURIComponent(NAME)
+                          + "&choice=" + choice, { method: "POST" });
+    const j = await r.json();
+    sayNote(j.error || j.result, !!j.error);
+  } catch (e) { sayNote("could not answer: " + e, true); }
+  setTimeout(pollAsk, 1500);
+}
+document.getElementById("askyes").addEventListener("click", () => answer("yes"));
+document.getElementById("askalways").addEventListener("click", () => answer("always"));
+document.getElementById("askno").addEventListener("click", () => answer("no"));
+askTerm.addEventListener("click", () => show("term"));
+pollAsk();
+setInterval(pollAsk, 5000);
+
+// Pull up past the end of the history and hold it there for a moment to
+// refresh the page -- the same gesture, stretch and hint as the terminal's.
+// A hold rather than a distance, because the end is where a flick lands.
+// The whole page reloads: that also finds the transcript again, which a
+// re-render of the old one would not, and the draft survives in storage.
+(function histPull() {
+  const MAX = 76, DAMP = .34, TRIP = 46, HOLD_MS = 1200, HOLD_PX = 10;
+  const hint = document.getElementById("pull");
+  const hintText = hint.firstElementChild;
+  let y0 = null, pull = 0, timer = null, armed = false;
+  const atEnd = () => hist.scrollHeight - hist.scrollTop - hist.clientHeight <= 1;
+  const showHint = () => {
+    hint.classList.add("down");
+    hint.style.bottom = (sayForm.offsetHeight + 12) + "px";   // above the box
+    hint.style.opacity = pull === 0 ? 0 : Math.min(1, Math.abs(pull) / TRIP);
+    hintText.textContent = armed ? "release to refresh" : "hold to refresh";
+  };
+  const reset = () => {
+    clearTimeout(timer); timer = null; armed = false; pull = 0;
+    hist.classList.remove("roost-pull");
+    hist.style.transform = "";
+    hint.style.opacity = 0;
+    hint.style.bottom = "";
+  };
+  hist.addEventListener("touchstart", (e) => {
+    y0 = atEnd() ? e.touches[0].clientY : null;
+  }, { passive: true });
+  hist.addEventListener("touchmove", (e) => {
+    if (y0 === null) return;
+    const dy = e.touches[0].clientY - y0;
+    if (dy >= 0 || !atEnd()) { if (pull) reset(); return; }
+    pull = Math.max(-MAX, dy * DAMP);
+    hist.classList.add("roost-pull");
+    hist.style.transform = "translateY(" + pull + "px)";
+    if (pull <= -HOLD_PX && !timer && !armed) {
+      timer = setTimeout(() => {
+        timer = null;
+        if (pull <= -HOLD_PX) { armed = true; showHint(); }
+      }, HOLD_MS);
+    }
+    showHint();
+  }, { passive: true });
+  const release = () => {
+    const go = armed;
+    reset();
+    y0 = null;
+    if (go) { meta.textContent = "refreshing…"; location.reload(); }
+  };
+  hist.addEventListener("touchend", release, { passive: true });
+  hist.addEventListener("touchcancel", release, { passive: true });
+})();
+
 const diag = document.getElementById("diag");
 function termState() {
   let doc = null;
@@ -7759,6 +9742,7 @@ function tuneTerminal() {
     + "  overscroll-behavior: contain;"        // no page pull-to-refresh
     + "  touch-action: pan-y;"                 // pan at once, no tap delay
     + "  scrollbar-width: thin; }"
+    + "html, body { overscroll-behavior: none; }"   // the frame's own root
     + ".xterm { transition: transform .3s cubic-bezier(.2,.85,.25,1); }"
     + ".xterm.roost-pull { transition: none; }";
   doc.head.appendChild(st);
@@ -7840,8 +9824,10 @@ function rubberBand(doc, v) {
     if (down) {
       hintText.textContent = armed ? "release to refresh" : "hold to refresh";
     } else {
-      hintText.textContent = px >= TRIP ? "release for history"
-                                        : "pull for history";
+      // The top of the scrollback says so, and that is all it does. It used
+      // to switch to the history view past a distance, which made a firm
+      // thumb-down -- the gesture for "further back" -- change tabs.
+      hintText.textContent = "start of scrollback";
     }
   };
 
@@ -7857,11 +9843,52 @@ function rubberBand(doc, v) {
   };
   const opts = { capture: true, passive: true };
 
+  // When the viewport has nothing to scroll, the program owns the screen --
+  // Claude Code's fullscreen renderer, tmux -- and scrolls its own history
+  // when it is sent a wheel. A desktop wheel already reaches it that way. A
+  // finger never did: the viewport is at its top and its end at once, so
+  // every drag down became the pull-for-history stretch and the program
+  // heard nothing, which is why thumb-down did nothing on a phone and the
+  // wheel worked on a laptop. So in that case the drag is turned into
+  // wheel events, one per row of travel, sent where xterm listens for them
+  // and reports them to the program.
+  //
+  // Which case this is comes from xterm itself: the alternate buffer is the
+  // program owning the screen. Measuring the viewport instead was the first
+  // attempt and missed every real session -- rows never divide the box
+  // exactly, so a fullscreen Claude Code still has 3px of slack on a phone
+  // and 31px on a laptop, and "nothing to scroll" was never quite true.
+  let appScrolls = false, wheelY = 0, wheelAcc = 0, wheelAt = null;
+  const rowPx = () => {
+    const r = doc.querySelector(".xterm-rows > div");
+    return (r && r.offsetHeight) || 17;
+  };
+  //
+  // Mouse reporting is asked first, and it is the question that matters:
+  // with it on, xterm hands a wheel to the program whatever buffer it is
+  // in. The buffer alone was wrong for any viewer that attached late --
+  // Claude Code re-sends its mouse modes when a viewer's attach resizes it,
+  // but never the alternate screen, so a fresh terminal sat in the normal
+  // buffer with nothing in it and every thumb-down became the stretch.
+  const programOwnsScreen = () => {
+    try {
+      const t = doc.defaultView.term;
+      const m = t.modes && t.modes.mouseTrackingMode;
+      if (m && m !== "none") return true;
+      const b = t.buffer.active;
+      if (b && b.type) return b.type === "alternate";
+    } catch (e) {}
+    return v.scrollHeight - v.clientHeight < rowPx();
+  };
+
   doc.addEventListener("touchstart", (e) => {
     if (flinging) { cancelAnimationFrame(flinging); flinging = null; }
     vel = [];
     termTouching = true; y0 = e.touches[0].clientY; pull = 0;
     vel.push({ t: performance.now(), y: y0 });
+    appScrolls = programOwnsScreen();
+    wheelY = y0; wheelAcc = 0;
+    wheelAt = { target: e.target, x: e.touches[0].clientX, y: y0 };
     trace("touchstart");
   }, opts);
 
@@ -7870,6 +9897,19 @@ function rubberBand(doc, v) {
     vel.push({ t: performance.now(), y });
     if (vel.length > 6) vel.shift();
     trace("touchmove");
+    if (appScrolls) {
+      wheelAcc += y - wheelY; wheelY = y;
+      const step = rowPx();
+      while (Math.abs(wheelAcc) >= step) {
+        const back = wheelAcc > 0;            // finger down: older lines
+        wheelAcc -= back ? step : -step;
+        wheelAt.target.dispatchEvent(new WheelEvent("wheel", {
+          deltaY: back ? -step : step, deltaMode: 0,
+          clientX: wheelAt.x, clientY: wheelAt.y,
+          bubbles: true, cancelable: true }));
+      }
+      return;
+    }
     const atTop = v.scrollTop <= 0;
     const atEnd = v.scrollHeight - v.scrollTop - v.clientHeight <= 1;
     if ((atTop && dy > 0) || (atEnd && dy < 0)) {
@@ -7883,16 +9923,24 @@ function rubberBand(doc, v) {
     }
   }, opts);
 
+  // And claim the drag. xterm used to do this for us: it cancels a touch
+  // while it has scrollback to move, which is what kept the browser out of
+  // it. With the program owning the screen there is no scrollback, xterm
+  // lets the touch through, and the browser takes it -- page pan, pull to
+  // refresh. The drag is ours in this case, so it is cancelled here.
+  doc.addEventListener("touchmove", (e) => {
+    if (appScrolls && e.cancelable) e.preventDefault();
+  }, { capture: true, passive: false });
+
   const release = () => {
     termTouching = false; lastTermTouch = Date.now();
-    const tripped = pull >= TRIP;
+    if (appScrolls) { appScrolls = false; trace("touchend"); return; }
     const refresh = armed;
     pull = 0; holdOff();
     box.classList.remove("roost-pull");       // spring back under the easing
     box.style.transform = "";
     setHint(0);
     trace("touchend");
-    if (tripped) { show("hist"); return; }
     if (refresh) { flashCopy("refreshing…"); reviveTerm(); return; }
     fling(v);
   };
@@ -8130,6 +10178,7 @@ function standDown() {
 }
 
 async function checkReader() {
+  if (!termStarted) return;          // not connected yet: nothing to check
   let cid = null;
   try {
     const u = new URL("api/term-reader", document.baseURI);
@@ -8142,7 +10191,18 @@ async function checkReader() {
 }
 
 takeover.onclick = takeTerm;
-takeTerm();
+// Connect the terminal when it is what was asked for, or the moment its tab
+// is opened -- never in the background behind the web view. Connecting is
+// claiming: a page sitting on the web view took the terminal from the
+// device actually using it.
+let termStarted = false;
+function startTerm() {
+  if (termStarted) return;
+  termStarted = true;
+  takeTerm();
+}
+termReady = true;
+if (START === "term") startTerm();
 // Often, because the gap between losing the terminal and saying so is a
 // gap in which the watchdog sees a dead connection and reconnects it. The
 // request is a name and a short string.
@@ -8312,15 +10372,33 @@ class Handler(BaseHTTPRequestHandler):
     # it takes over, so an idle terminal is unaffected.
     timeout = 30
 
+    def _gzip(self, data, ctype):
+        """(body, compressed). Text compresses about five-fold, and on a
+        phone over a slow link the page and its transcript are most of the
+        wait: 125 KB of history JSON was 4 s at airplane speed before
+        anything showed. Only text types, only when the browser says it
+        takes gzip, and only past a kilobyte; fonts and images are already
+        compressed."""
+        if len(data) < 1024 or "gzip" not in (self.headers.get("Accept-Encoding") or ""):
+            return data, False
+        if not (ctype.startswith("text/") or "json" in ctype
+                or "javascript" in ctype or "svg" in ctype):
+            return data, False
+        import gzip as _gz
+        return _gz.compress(data, 6), True
+
     def _send(self, code, body, ctype="application/json"):
         csp = None
         if ctype == "text/html":
             body, csp = with_nonce(body)
-        data = body.encode()
+        data, packed = self._gzip(body.encode(), ctype)
         self.send_response(code)
         if csp:
             self.send_header("Content-Security-Policy", csp)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
+        if packed:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self._no_framing()
@@ -8336,8 +10414,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
 
     def _send_bytes(self, data, ctype, cache="public, max-age=604800"):
+        data, packed = self._gzip(data, ctype)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        if packed:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
         self._no_framing()
@@ -8525,7 +10607,19 @@ class Handler(BaseHTTPRequestHandler):
             m = _re2.search(r"resume\s+([0-9a-f-]{36})", cmd)
             files = codex_files(200)        # newest first
             hist = ""
-            if m:
+            # By evidence first: the session id this session's own hooks (or
+            # its process) report under its roost name.
+            nm = _re2.search(r"ROOST_NAME=([A-Za-z0-9_-]+)", cmd)
+            sid = session_id_for(nm.group(1) if nm else n)
+            if sid:
+                if claude_path(sid):
+                    hist = "codex?file=claude:" + sid
+                else:
+                    for f in files:
+                        if sid in f["file"]:
+                            hist = "codex?file=" + f["file"]
+                            break
+            if m and not hist:
                 uid = m.group(1)
                 for f in files:
                     if uid in f["file"]:
@@ -8953,6 +11047,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"cid": TERM_READER.get(n, "")}))
         elif self.path.startswith("/api/ping"):
             self._send(200, json.dumps({"id": SERVER_ID, "build": BUILD}))
+        elif self.path.startswith("/api/ask"):
+            from urllib.parse import parse_qs, urlparse
+            n = (parse_qs(urlparse(self.path).query).get("name") or [""])[0]
+            if not n or not all(c.isalnum() or c in "-_" for c in n):
+                self._send(400, json.dumps({"error": "bad name"}))
+                return
+            self._send(200, json.dumps(session_ask(n)))
+        elif self.path.startswith("/api/userturns"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            p = _codex_path((q.get("file") or [""])[0])   # refuses outside the session trees
+            try:
+                since = float((q.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0.0
+            if p is None:
+                self._send(400, json.dumps({"error": "no such transcript"}))
+                return
+            self._send(200, json.dumps({"turns": user_turns(p, since)}))
+        elif self.path.startswith("/api/said"):
+            from urllib.parse import parse_qs, urlparse
+            n = (parse_qs(urlparse(self.path).query).get("name") or [""])[0]
+            if not n or not all(c.isalnum() or c in "-_" for c in n):
+                self._send(400, json.dumps({"error": "bad name"}))
+                return
+            self._send(200, json.dumps({"said": said_recent(n)}))
         elif self.path.startswith("/api/whoami"):
             # What tailscaled's serve proxy says about the caller. These are
             # populated for tailnet traffic only, and tailscaled strips any
@@ -8996,8 +11116,17 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             agent = (q.get("agent") or ["claude"])[0]
-            name, err = add_session((q.get("path") or [""])[0],
-                                    (q.get("name") or [""])[0], agent)
+            path = (q.get("path") or [""])[0]
+            note = ""
+            if (q.get("create") or ["0"])[0] == "1":
+                # A new repository first, in path as its parent; then the
+                # card, exactly as for a folder that was already there.
+                path, err, note = new_repo(path, (q.get("name") or [""])[0], agent,
+                                           (q.get("template") or ["1"])[0] == "1")
+                if err:
+                    self._send(400, json.dumps({"error": err}))
+                    return
+            name, err = add_session(path, (q.get("name") or [""])[0], agent)
             if err:
                 self._send(400, json.dumps({"error": err}))
                 return
@@ -9006,6 +11135,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = (("codex started" if start_terminal(name[len("term:"):])
                            else "could not start codex")
                           if name.startswith("term:") else press(name))
+            if note:
+                result += "; " + note
             self._send(200, json.dumps({"result": result, "name": name}))
             return
         if self.path.startswith("/api/favorite"):
@@ -9026,7 +11157,7 @@ class Handler(BaseHTTPRequestHandler):
                 rec = self.rfile.read(min(n, 1 << 20)).decode("utf-8", "replace")
                 trace = Path.home() / ".roost" / "trace.jsonl"
                 trace.parent.mkdir(mode=0o700, exist_ok=True)
-                if trace.exists() and trace.stat().st_size > 64 << 20:
+                if trace.exists() and trace.stat().st_size > 8 << 20:
                     trace.replace(trace.with_suffix(".jsonl.old"))
                 fd = os.open(trace, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 with os.fdopen(fd, "a") as fh:
@@ -9049,6 +11180,12 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = reorder(names)
             self._send(200 if ok else 409, json.dumps(
                 {"result": msg} if ok else {"error": msg}))
+            return
+        if self.path.startswith("/api/stop"):
+            from urllib.parse import parse_qs, urlparse
+            name = parse_qs(urlparse(self.path).query).get("name", [""])[0]
+            ok, msg = stop_session(name)
+            self._send(200 if ok else 400, json.dumps({"result" if ok else "error": msg}))
             return
         if self.path.startswith("/api/restart"):
             from urllib.parse import parse_qs, urlparse
@@ -9167,9 +11304,92 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as e:
                 self._send(500, json.dumps({"error": str(e)}))
                 return
-            # A space after it, so whatever you type next is a separate word.
-            paste_into(name, str(f) + " ")
+            # type=0: store it and say where, for the history view's message
+            # box, which sends the path with the message rather than leaving
+            # it alone in the composer.
+            if (parse_qs(urlparse(self.path).query).get("type") or ["1"])[0] != "0":
+                # A space after it, so whatever you type next is a separate word.
+                paste_into(name, str(f) + " ")
             self._send(200, json.dumps({"path": str(f), "bytes": len(data)}))
+            return
+        if self.path.startswith("/api/answer"):
+            # A button in the web view answering codex's approval prompt:
+            # the key the prompt takes, and nothing else -- and only while
+            # the prompt is still there, re-checked now, so a stale tap
+            # cannot put a "y" into the composer.
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            name = (q.get("name") or [""])[0]
+            choice = (q.get("choice") or [""])[0]
+            if not name or not all(c.isalnum() or c in "-_" for c in name) \
+               or choice not in ANSWER_KEYS:
+                self._send(400, json.dumps({"error": "bad request"}))
+                return
+            kind, card, transport, err = say_target(name)
+            if err:
+                self._send(400, json.dumps({"error": err}))
+                return
+            if kind != "codex":
+                self._send(400, json.dumps({"error": "answer this one in the terminal"}))
+                return
+            a = session_ask(name)
+            if a.get("state") != "waiting":
+                self._send(409, json.dumps({"error": "@%s is not asking anything now" % name}))
+                return
+            _dtach_push_path(Path.home() / ".dtach" / name, ANSWER_KEYS[choice], newline=False)
+            self._send(200, json.dumps({"result": "answered " + choice}))
+            return
+        if self.path.startswith("/api/say"):
+            # A message from the history view's box: text, and the paths of
+            # pictures already stored by /api/paste?type=0.
+            from urllib.parse import parse_qs, urlparse
+            name = parse_qs(urlparse(self.path).query).get("name", [""])[0]
+            if not name or not all(c.isalnum() or c in "-_" for c in name):
+                self._send(400, json.dumps({"error": "bad name"}))
+                return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = _jobj(self.rfile.read(n) or b"{}") or {}
+                text = body.get("text", "")
+                images = body.get("images") or []
+                if not isinstance(text, str) or not isinstance(images, list):
+                    raise ValueError
+            except (ValueError, OSError):
+                self._send(400, json.dumps({"error": "bad body"}))
+                return
+            text = _clean_say(text)
+            if len(text) > SAY_MAX:
+                self._send(413, json.dumps({"error": "longer than %d characters" % SAY_MAX}))
+                return
+            # Only pictures this server stored: anything else is a path into
+            # the agent's prompt that nobody chose.
+            paths = []
+            pdir = PASTE_DIR.resolve()
+            for p in images:
+                try:
+                    q = Path(str(p)).resolve()
+                except (OSError, ValueError, RuntimeError):
+                    q = None
+                if not q or q.parent != pdir or not q.is_file():
+                    self._send(400, json.dumps({"error": "not a stored picture"}))
+                    return
+                paths.append(str(q))
+            msg = " ".join(paths + ([text] if text else []))
+            if not msg:
+                self._send(400, json.dumps({"error": "empty"}))
+                return
+            kind, card, transport, err = say_target(name)
+            if err:
+                self._send(400, json.dumps({"error": err}))
+                return
+            if say_waiting(kind, card):
+                self._send(409, json.dumps({"error":
+                    "@%s is waiting on a question in the terminal: answer it "
+                    "there first, then send" % name}))
+                return
+            say_into(name, card, transport, msg, kind)
+            said_log(name, text, paths)
+            self._send(200, json.dumps({"result": "sent"}))
             return
         if self.path.startswith("/api/type"):
             # Types one line into a tmux session and presses Enter. Note this
@@ -9311,6 +11531,24 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the tmux pane quiet
 
 
+def decline_loop():
+    """The only clock this server has that does not need a browser.
+
+    A question that arrives while nobody is watching is exactly the one worth
+    answering, so this cannot wait for a page to poll."""
+    while True:
+        time.sleep(20)
+        if not AUTO_DECLINE:
+            continue
+        try:
+            for n, p in list(FOLDERS.items()):
+                note = try_decline(n, p)
+                if note:
+                    print("guard %s: %s" % (n, note))
+        except Exception as e:               # a watchdog must not die quietly
+            print("guard loop: %s: %s" % (type(e).__name__, e))
+
+
 if __name__ == "__main__":
     import socket as _socket
     import socketserver as _ss
@@ -9355,7 +11593,19 @@ if __name__ == "__main__":
             sys.exit(3)
         finally:
             probe.close()
+    if AUTO_DECLINE:
+        _thr.Thread(target=decline_loop, daemon=True).start()
+        print("auto-decline is on: roost will refuse commands its policy "
+              "denies, and will never approve anything")
     srv = UnixHTTPServer(str(SOCK), Handler)
     os.chmod(SOCK, 0o600)
+    replay_load()
+    _thr.Thread(target=_replay_saver, daemon=True).start()
+    _thr.Thread(target=_warm_transcripts, daemon=True).start()
+
+    def _on_term(signum, frame):
+        replay_save()                 # what a phone reconnects to next
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_term)
     print(f"roost serving on unix:{SOCK} (sessions: {', '.join(FOLDERS)})")
     srv.serve_forever()

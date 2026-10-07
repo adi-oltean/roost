@@ -64,6 +64,106 @@ is free; driving is best done from one place at a time.
 
 ---
 
+## Refusing what would have been refused
+
+An agent proposes `cd x && git status`, or a four-stage pipeline, or a
+heredoc. If this workspace's rules say no to that shape — write a script and
+run it, use `git -C`, use the file tools — the session stops and waits for
+somebody to say so. On a machine nobody is watching, that wait is hours, and
+it ends with the answer everyone knew in advance.
+
+`./roost-guard` is a **PreToolUse hook** for that: both Claude Code and codex
+run one before a tool call and let it block the call outright, handing the
+reason back to the model rather than to a person. The refusal is instant and
+the session keeps going.
+
+```sh
+echo 'cd /tmp && ls' | ./roost-guard --explain    # what it would decide
+./roost-guard --test                              # the rules, against their cases
+./roost-guard --install                           # what to add, and where
+```
+
+It refuses commands joined by `&&`, `||` or `;`, pipelines longer than one
+filter, command substitution, heredocs, redirection, `python3 -c`, and
+`cat`/`grep`/`find` used where the file tools do the job — each with the
+sanctioned alternative in the reason, because an agent told only "no" tries
+another spelling. Destructive commands (`rm`, `git reset --hard`,
+`git push --force`) are sent to **you** rather than refused: that is the
+prompt that should reach a person. A rule that fires repeatedly in one
+session escalates to a prompt too, so the guard cannot become its own stuck
+session.
+
+Operators inside quotes are text, not operators: it walks the command rather
+than matching a regex over it, so `grep 'a && b'` is allowed. Rules are
+turned off per machine in `~/.roost/guard.json` or per project in
+`.roost-guard.json`, and every refusal is one line in `~/.roost/guard.jsonl`.
+
+The hook is one of two ways roost can refuse, and the better one. With
+`auto_decline` set and no hook installed, roost instead watches for a session
+stopped on a question it can judge and presses **Escape** itself — nothing to
+add to the agent's configuration, and it works on a session that was already
+running. It is the weaker path, and its limits are worth knowing before you
+rely on it:
+
+- **Escape cancels the whole batch, not one call.** An agent that sends a
+  banned command alongside three sound ones loses all four, and the log names
+  only the command that was judged. The hook blocks exactly the call it
+  refused.
+- **The reason is best-effort.** The agent's harness tells it that the call
+  was denied; the *why* is typed at the session's prompt afterwards, which
+  only works while the session is still sitting there. A denied call hands
+  control straight back to the model, so a session is often working again
+  before the text lands. Roost checks whether the line submitted and takes it
+  back when it did not, rather than leaving it in the composer looking like
+  something you typed.
+- **It answers only questions it can see** — from the sensor's record, not
+  from the screen.
+
+---
+
+## Handoffs that can be ordered
+
+Two agents working one problem hand it back and forth, and after enough
+rounds nobody can tell which handoff is the last one or whose turn it is.
+
+The usual arrangement causes that rather than suffering from it: one
+`HANDOFF.md`, rewritten each time. A file edited in place has no version —
+the number in its title is a separate act from changing the content, and
+that act is the one people skip. Real examples, all found in one afternoon:
+a file titled `v15` containing v16, one titled `Handoff v1` mentioning v8,
+and one rewritten fourteen times whose round number survives only in commit
+messages nobody reads while working.
+
+`./roost-handoff` writes them append-only instead. Each is a new file, never
+edited, and its name carries everything needed to order it and route it:
+
+```
+handoffs/0007-20260920T1146Z-codex-to-claude.md
+         ^^^^ ^^^^^^^^^^^^^^ ^^^^^    ^^^^^^
+         seq  when (UTC)     from     to
+```
+
+```sh
+ROOST_NAME=codex ./roost-handoff new --to claude   # writes it, prints the path
+./roost-handoff latest                             # the newest, and whose turn
+./roost-handoff list                               # all of them, newest first
+./roost-handoff --test                             # the rules, against their cases
+```
+
+Which is the last one is the highest number; whose turn it is, is that one's
+`to`. Neither question needs a file opened. The number is allocated with
+`O_EXCL`, so two sessions handing off in the same second cannot take the
+same one — the loser takes the next. A file in the directory that is not
+named this way is reported rather than ignored, since a handoff nobody can
+order is the problem this replaces.
+
+The directory is found by walking up from wherever the session is, so one
+deep in a worktree writes to the same sequence as one at the repository
+root; the search stops at the repository, so it cannot wander into another
+project's handoffs.
+
+---
+
 ## Why this, and not the agent's own remote control
 
 Claude Code mints a `claude.ai/code` link with `/rc`, and codex has its app.
@@ -501,9 +601,19 @@ repositories live in and the tailnet login allowed in, guesses both, and
 leaves the session list empty — the **+** button in the top bar fills it by
 browsing that root.
 
-`config.json` is **not tracked** — the dashboard writes `card_order`,
-`favorites` and new sessions into it, and one machine's folder list is not
-another's.
+`config.json` is **not tracked by this repository** — the dashboard writes
+`card_order`, `favorites` and new sessions into it, and one machine's folder
+list is not another's. It belongs in a repository of its own: put a
+`roost-config/` directory beside the code and the server, `restart.sh`,
+`term.sh`, `fork-session.sh` and `ccmsg` all read `roost-config/config.json`
+instead, with `ROOST_CONFIG_DIR` overriding both. That directory can then be
+a private repository, so the config is versioned and backed up without this
+one ever carrying it. A fresh clone has none, and everything falls back to
+the file beside the code.
+
+It is a directory rather than a symlinked file on purpose: the config is
+replaced by rename on every write, which would destroy a symlink the first
+time you reordered a card and silently leave the versioned copy stale.
 Run it **before** starting the server: with no config of its own the server
 copies `config.example.json`, whose placeholder login refuses everybody, and
 `onboarding.sh` then finds a config already there — `--force` rewrites it.

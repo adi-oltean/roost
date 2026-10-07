@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Refuse the shell commands a person would refuse anyway, before anyone is asked.
+
+An agent proposes `cd x && git status`, or a four-stage pipeline, or a
+heredoc. The workspace's rules say: not that — write a script under tmp/ and
+run it, or use `git -C`, or use the file tools. The agent cannot know that
+until somebody says so, so the session stops and waits. On a machine nobody
+is watching that wait is hours long, and it ends with the answer everyone
+knew in advance: no.
+
+This is a PreToolUse hook. Both Claude Code and codex run one before a tool
+call and let it block the call outright, handing the reason back to the model
+instead of to a person. The refusal is instant, the session keeps going, and
+the reason says what to do instead — which is the part that makes the next
+attempt right rather than merely different.
+
+    stdin   the hook payload as JSON (either agent's shape)
+    stdout  a decision, as JSON, for the agent that understands it
+    stderr  the same reason in prose, for the agent that reads exit code 2
+    exit    0 with a JSON decision, or 2 to block with the stderr text
+
+Run it with no stdin to see what it would do:
+
+    echo 'cd /tmp && ls' | ./roost-guard --explain
+    ./roost-guard --test          # the rules, against the cases they are for
+    ./roost-guard --install       # what to add to which config file
+"""
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.path.expanduser("~"))
+LOG = HOME / ".roost" / "guard.jsonl"
+POLICY_FILES = [HOME / ".roost" / "guard.json", Path(".roost-guard.json")]
+
+# A rule fires on the command as written, says why, and says what to do
+# instead. The second half matters more than the first: an agent told only
+# "no" tries a spelling variant, and the session is stuck again in ten
+# seconds. An agent told "write tmp/ro/check.sh and run it" is unstuck.
+DENY = "deny"
+ASK = "ask"
+ALLOW = "allow"
+
+FILTERS = {"head", "tail", "grep", "wc", "sort", "uniq", "jq", "cut"}
+READ_TOOLS = {"cat", "head", "tail", "sed", "awk", "cut", "find", "rg", "grep"}
+DESTRUCTIVE = [
+    ("rm", lambda w: w[:1] == ["rm"]),
+    ("git rm", lambda w: w[:2] == ["git", "rm"]),
+    ("git reset --hard", lambda w: w[:2] == ["git", "reset"] and "--hard" in w),
+    ("git clean", lambda w: w[:2] == ["git", "clean"]),
+    ("git push --force", lambda w: w[:2] == ["git", "push"]
+     and ("--force" in w or "-f" in w or any(x.startswith("--force-with") for x in w))),
+    ("git stash drop", lambda w: w[:3] == ["git", "stash", "drop"]),
+    ("git checkout --", lambda w: w[:2] == ["git", "checkout"] and "--" in w),
+]
+
+
+def scan(cmd):
+    """Where the shell operators are, ignoring the ones inside quotes.
+
+    A regex over the whole string calls `grep 'a && b'` a compound command
+    and refuses it, which teaches an agent that the rule is arbitrary. This
+    walks the string instead, so only operators the shell would act on
+    count."""
+    ops = []                      # (operator, index)
+    i, n = 0, len(cmd)
+    quote = None                  # "'", '"' or None
+    while i < n:
+        c = cmd[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            elif quote == '"' and cmd.startswith("$(", i):
+                ops.append(("$(", i))          # substitution is live in ""
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            i += 1
+            continue
+        if c == "\\":
+            if i + 1 < n and cmd[i + 1] in ";|&<>":
+                ops.append(("\\" + cmd[i + 1], i))     # find -exec … \;
+            i += 2
+            continue
+        for op in ("<<<", "<<", "&&", "||", ">>", "2>&1", "$(", "`", ";", "|", ">", "<"):
+            if cmd.startswith(op, i):
+                # "|" inside "||" is already taken; ">" inside "2>&1" too
+                ops.append((op, i))
+                i += len(op) - 1
+                break
+        i += 1
+    return ops
+
+
+def words(cmd):
+    """The command's own words, up to the first operator."""
+    cut = len(cmd)
+    for op, at in scan(cmd):
+        cut = min(cut, at)
+    head = cmd[:cut].strip()
+    out, cur, quote = [], "", None
+    for c in head:
+        if quote:
+            if c == quote:
+                quote = None
+            else:
+                cur += c
+        elif c in "'\"":
+            quote = c
+        elif c.isspace():
+            if cur:
+                out.append(cur)
+                cur = ""
+        else:
+            cur += c
+    if cur:
+        out.append(cur)
+    # `env A=b cmd`, `sudo cmd`, `time cmd`: the real command is behind them
+    while out and ("=" in out[0] or out[0] in ("env", "time", "nohup")):
+        out = out[1:]
+    return out
+
+
+def segments(cmd, ops):
+    """The commands on either side of the top-level pipes."""
+    cuts = [at for op, at in ops if op == "|"]
+    parts, last = [], 0
+    for at in cuts:
+        parts.append(cmd[last:at])
+        last = at + 1
+    parts.append(cmd[last:])
+    return parts
+
+
+def judge(cmd, policy):
+    """(decision, rule, reason) for one command line."""
+    ops = [op for op, _ in scan(cmd)]
+    w = words(cmd)
+    off = policy.get("off", [])
+
+    def on(rule):
+        return rule not in off
+
+    # A command that is already the sanctioned shape is not worth parsing
+    # further: the whole point of the rules is to arrive here.
+    if w[:1] == ["bash"] and len(w) > 1 and w[1].startswith(("tmp/ro/", "tmp/rw/")):
+        return ALLOW, "", ""
+
+    if on("destructive"):
+        for name, match in DESTRUCTIVE:
+            if match(w):
+                return (ASK, "destructive",
+                        "%s is destructive, so it is not something a policy can "
+                        "wave through: this is the prompt that should reach a "
+                        "person. If they did ask for it, they will say yes." % name)
+
+    if on("compound") and any(o in ("&&", "||", ";") for o in ops):
+        alt = ""
+        if w[:1] == ["cd"] and "git" in cmd:
+            alt = " For git in another folder, `git -C <path> <subcommand>` is one command."
+        return (DENY, "compound",
+                "Two commands joined by && || or ; are one approval prompt for "
+                "an unreviewable whole. Send them as separate tool calls, or, if "
+                "they belong together, put them in a script under tmp/ro (read "
+                "only) or tmp/rw (changes something) and run `bash tmp/ro/<name>.sh`."
+                + alt)
+
+    if on("substitution") and any(o in ("$(", "`") for o in ops):
+        return (DENY, "substitution",
+                "Command substitution has to be read as a whole to be judged, so "
+                "it always asks. Put the pipeline in a script under tmp/ro and run "
+                "the script; its name is what gets approved, once.")
+
+    if on("heredoc") and any(o in ("<<", "<<<") for o in ops):
+        return (DENY, "heredoc",
+                "A heredoc makes the command unreadable in the prompt. Write the "
+                "file with the Write tool, then run it.")
+
+    if on("redirect") and any(o in (">", ">>", "<", "2>&1") for o in ops):
+        return (DENY, "redirect",
+                "Redirection writes files that nobody reviewed. Use the Write "
+                "tool for a file, or a script under tmp/ if the command itself "
+                "must produce one. To drop stderr, leave it: it goes to the "
+                "terminal, not into the answer.")
+
+    if on("escaped") and any(o.startswith("\\") for o in ops):
+        return (DENY, "escaped",
+                "A backslash-escaped operator (\\; \\|) reads as an injection "
+                "attempt to every reviewer, human or not. A script under tmp/ro "
+                "does the same work and can be read.")
+
+    pipes = [o for o in ops if o == "|"]
+    if pipes and on("pipes"):
+        parts = segments(cmd, scan(cmd))
+        tails = [words(p) for p in parts[1:]]
+        simple = all(t and t[0] in FILTERS for t in tails)
+        if len(pipes) > 1 or not simple:
+            return (DENY, "pipes",
+                    "One pipe into head, tail, grep or wc is fine; a chain is a "
+                    "program. Write it as a script under tmp/ro and run that — "
+                    "then it is reviewable once instead of every time.")
+
+    if on("read-tools") and w and w[0] in READ_TOOLS:
+        return (DENY, "read-tools",
+                "%s as the command itself is what the file tools are for: Read "
+                "for a file, Grep for a search, Glob for names. They need no "
+                "approval and they do not truncate. If it really has to be the "
+                "shell, put it in tmp/ro/<name>.sh." % w[0])
+
+    if on("python-c") and w[:2] in (["python", "-c"], ["python3", "-c"]):
+        return (DENY, "python-c",
+                "`python3 -c` puts a program inside a command line, with two "
+                "levels of quoting for a person to check. Write tmp/ro/<name>.py "
+                "and run `python3 tmp/ro/<name>.py`.")
+
+    return ALLOW, "", ""
+
+
+def load_policy():
+    """Machine policy, then project policy; later files win."""
+    policy = {"off": [], "escalate_after": 3, "window_minutes": 10}
+    for p in POLICY_FILES:
+        try:
+            policy.update(json.loads(p.read_text()))
+        except (OSError, ValueError):
+            pass
+    return policy
+
+
+def recent_denials(session, rule, policy):
+    """How many times this session has just been told this same thing.
+
+    An agent that cannot find another way will try the same shape again, and
+    a hook that says no forever is its own kind of stuck session. After a few
+    rounds the decision becomes "ask", which is the point at which a person
+    genuinely is the fastest way forward."""
+    window = time.time() - 60 * policy.get("window_minutes", 10)
+    n = 0
+    try:
+        with LOG.open() as fh:
+            for line in fh.readlines()[-400:]:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("session") == session and r.get("rule") == rule \
+                   and r.get("at", 0) > window:
+                    n += 1
+    except OSError:
+        pass
+    return n
+
+
+CAP = 4 << 20                      # and one previous file: 8 MB in all
+
+
+def log(rec):
+    try:
+        LOG.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > CAP:
+            LOG.replace(LOG.with_suffix(".jsonl.old"))
+        with LOG.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+SHELLS = {"bash", "sh", "zsh", "dash", "/bin/bash", "/bin/sh", "/usr/bin/bash"}
+
+
+def unwrap(cmd):
+    """`bash -lc "<command>"` is the wrapper an agent runs things through;
+    what matters is the command inside it."""
+    for _ in range(3):                            # -lc inside -lc, rarely
+        w = words(cmd)
+        if len(w) >= 3 and w[0] in SHELLS and w[1].startswith("-") \
+           and "c" in w[1].lstrip("-"):
+            inner = cmd.split(w[1], 1)[1].strip()
+            if inner[:1] in ("'", '"') and inner[-1:] == inner[:1]:
+                inner = inner[1:-1]
+            if not inner:
+                break
+            cmd = inner
+            continue
+        break
+    return cmd
+
+
+def payload_command(data):
+    """The command, out of either agent's payload shape."""
+    if not isinstance(data, dict):
+        return "", "", ""
+    ti = data.get("tool_input")
+    ti = ti if isinstance(ti, dict) else {}
+    cmd = ti.get("command") or data.get("command") or ""
+    if isinstance(cmd, list):                     # argv form: bash -lc "..."
+        parts = [str(x) for x in cmd]
+        if len(parts) >= 3 and parts[0] in SHELLS and parts[1].startswith("-"):
+            cmd = parts[-1]
+        else:
+            cmd = " ".join(parts)
+    cmd = unwrap(str(cmd))
+    name = data.get("tool_name") or data.get("tool") or ""
+    return (str(cmd), str(name),
+            str(data.get("session_id") or data.get("session") or ""),
+            str(data.get("cwd") or ""))
+
+
+def decide(cmd, session, policy):
+    decision, rule, reason = judge(cmd, policy)
+    if decision == DENY:
+        seen = recent_denials(session, rule, policy)
+        if seen >= policy.get("escalate_after", 3):
+            decision = ASK
+            reason += (" (Asked to stop doing this %d times already, so this one "
+                       "goes to a person.)" % seen)
+    return decision, rule, reason
+
+
+def main(argv):
+    policy = load_policy()
+
+    if "--test" in argv:
+        return selftest(policy)
+    if "--install" in argv:
+        print(INSTALL)
+        return 0
+
+    raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+    explain = "--explain" in argv
+    cwd = ""
+    try:
+        data = json.loads(raw)
+        cmd, tool, session, cwd = payload_command(data)
+    except ValueError:
+        cmd, tool, session = unwrap(raw.strip()), "Bash", ""   # --explain
+
+    if not cmd or (tool and tool not in ("Bash", "shell", "exec", "local_shell")):
+        return 0                                          # not ours to judge
+
+    decision, rule, reason = decide(cmd, session, policy)
+    if decision != ALLOW:
+        log({"at": time.time(), "session": session, "cwd": cwd,
+             "rule": rule, "decision": decision, "cmd": cmd[:400]})
+
+    if explain:
+        print("%-6s %-13s %s" % (decision, rule or "-", reason or "(allowed)"))
+        return 0
+    if decision == ALLOW:
+        return 0
+
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason}}))
+    if decision == DENY and "--exit2" in argv:
+        sys.stderr.write(reason + "\n")
+        return 2
+    return 0
+
+
+CASES = [
+    # (command, expected decision, note)
+    ("ls", ALLOW, "a plain command"),
+    ("git -C ../other status", ALLOW, "git elsewhere, one command"),
+    ("bash tmp/ro/check.sh", ALLOW, "the sanctioned shape"),
+    ("cat notes.md | head -20", DENY, "cat is the file tools' job"),
+    ("ps -eo pid,args | grep python", ALLOW, "one filter pipe"),
+    ("ps aux | grep x | grep -v grep | awk '{print $2}'", DENY, "a pipeline"),
+    ("cd /tmp && ls", DENY, "two commands"),
+    ("ls; pwd", DENY, "two commands, other spelling"),
+    ("echo $(date)", DENY, "substitution"),
+    ("echo `date`", DENY, "substitution, backticks"),
+    ("python3 -c 'import os; print(os.getcwd())'", DENY, "a program in a flag"),
+    ("cat > file.txt", DENY, "redirect"),
+    ("python3 - <<'EOF'\nprint(1)\nEOF", DENY, "heredoc"),
+    ("find . -name '*.tmp' -exec rm {} \\;", DENY, "escaped operator"),
+    ("rm -rf build", ASK, "destructive: a person should see this"),
+    ("git push --force origin main", ASK, "destructive"),
+    ("grep -r 'a && b' .", DENY, "grep is the Grep tool's job"),
+    ("echo 'a && b'", ALLOW, "operators inside quotes are text"),
+    ("echo \"one | two\"", ALLOW, "quoted pipe is text"),
+    ("git commit -F tmp/commit-msg.txt", ALLOW, "the sanctioned commit shape"),
+    ("npm test", ALLOW, "ordinary work"),
+    ("tail -5 server.log", DENY, "tail is the Read tool's job"),
+    ("bash -lc 'ps aux | grep x | wc -l'", DENY, "judged inside the wrapper"),
+    ("bash -lc 'npm test'", ALLOW, "wrapper around ordinary work"),
+]
+
+
+def selftest(policy):
+    bad = 0
+    for cmd, want, note in CASES:
+        got, rule, _ = judge(unwrap(cmd), policy)
+        ok = got == want
+        bad += not ok
+        print("  %-5s %-6s %-11s %s" % ("ok" if ok else "FAIL", got, rule or "-",
+                                        note if ok else "%s  <%s>" % (note, cmd)))
+    print("  %d case%s, %d failed" % (len(CASES), "" if len(CASES) == 1 else "s", bad))
+    return 1 if bad else 0
+
+
+INSTALL = """\
+roost-guard is a PreToolUse hook. Wire it into whichever agents you run; it
+needs no daemon and keeps no state beyond ~/.roost/guard.jsonl.
+
+Claude Code — ~/.claude/settings.json (or .claude/settings.json per project):
+
+  {
+    "hooks": {
+      "PreToolUse": [
+        { "matcher": "Bash",
+          "hooks": [ { "type": "command",
+                       "command": "/path/to/roost/roost-guard" } ] }
+      ]
+    }
+  }
+
+  It takes effect on the next tool call; no restart. `/hooks` lists what is
+  registered, and `claude --debug` shows a hook that is failing.
+
+codex — ~/.codex/config.toml:
+
+  [[hooks.PreToolUse]]
+  matcher = "shell"
+  [[hooks.PreToolUse.hooks]]
+  type = "command"
+  command = "/path/to/roost/roost-guard --exit2"
+
+Then try it:
+
+  echo 'cd /tmp && ls' | ./roost-guard --explain
+  ./roost-guard --test
+
+Turn a rule off in ~/.roost/guard.json (per machine) or .roost-guard.json
+(per project):
+
+  { "off": ["read-tools"], "escalate_after": 3, "window_minutes": 10 }
+"""
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

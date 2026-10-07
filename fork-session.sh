@@ -21,6 +21,16 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# Where the live config is. A roost-config directory beside this script wins
+# when it exists, which is what lets the config be a private repository of
+# its own rather than a gitignored file nothing has a copy of.
+# ROOST_CONFIG_DIR overrides it. Exported because the python3 programs below
+# are single-quoted, where a shell variable would not expand.
+ROOST_CFG=config.json
+[ -d roost-config ] && ROOST_CFG=roost-config/config.json
+[ -n "${ROOST_CONFIG_DIR:-}" ] && ROOST_CFG="$ROOST_CONFIG_DIR/config.json"
+export ROOST_CFG
+
 REL="${1:-}"; NAME="${2:-}"
 [ -n "$REL" ] || { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 REL="${REL#/}"; REL="${REL%/}"
@@ -30,13 +40,13 @@ case "$NAME" in
 esac
 export NAME
 
-SRC=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open("config.json")).get("src_dir","~/src")))')
+SRC=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open(os.environ["ROOST_CFG"])).get("src_dir","~/src")))')
 # The dashboard listens on a Unix socket, not a TCP port (see SECURITY.md).
-SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open("config.json")).get("socket","~/.roost/roost.sock")))')
+SOCK=$(python3 -c 'import json,os;print(os.path.expanduser(json.load(open(os.environ["ROOST_CFG"])).get("socket","~/.roost/roost.sock")))')
 DIR="$SRC/$REL"; export DIR
 # The dashboard refuses a request with no Tailscale identity; see restart.sh.
-WHO=$(python3 -c 'import json
-a = json.load(open("config.json")).get("allow_logins") or []
+WHO=$(python3 -c 'import json, os
+a = json.load(open(os.environ["ROOST_CFG"])).get("allow_logins") or []
 print(a[0] if a else "")')
 AUTH=(); [ -n "$WHO" ] && AUTH=(-H "Tailscale-User-Login: $WHO")
 
@@ -51,9 +61,9 @@ fi
 # 1. config entry. Plain string when the name is just the basename; the
 #    {path,name} form only when it actually differs, to keep config readable.
 python3 - "$REL" "$NAME" <<'PY' || exit 1
-import json, sys, pathlib
+import json, os, sys, pathlib
 rel, name = sys.argv[1], sys.argv[2]
-p = pathlib.Path("config.json"); cfg = json.loads(p.read_text())
+p = pathlib.Path(os.environ["ROOST_CFG"]); cfg = json.loads(p.read_text())
 names = [e["name"] if isinstance(e, dict) else pathlib.PurePath(e).name for e in cfg["folders"]]
 if name in names:
     print(f"'{name}' is already a button", file=sys.stderr); sys.exit(1)

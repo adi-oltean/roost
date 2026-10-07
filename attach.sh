@@ -41,6 +41,15 @@ cmd=$(cat "$DIR/$name.cmd")
 # what lets a page hand the terminal over to another page.
 if [ ! -S "$DIR/$name" ]; then
   [ -e "$DIR/$name" ] && rm -f "$DIR/$name"     # a stale file, not a socket
+  # The same scrub the Start button does. This runs in ttyd's environment,
+  # and a ttyd started from inside a Claude session carries
+  # CLAUDE_CODE_CHILD_SESSION and CLAUDECODE: a session created here then
+  # inherits them and Claude Code runs it as a child -- no session record,
+  # so no history tab and no status on its card. TMUX likewise would make it
+  # record itself as living in someone else's pane.
+  for v in $(compgen -e); do
+    case "$v" in CLAUDE*|TMUX|TMUX_PANE) unset "$v" ;; esac
+  done
   dtach -n "$DIR/$name" -r winch bash -lc "$cmd"
   for _ in $(seq 1 40); do [ -S "$DIR/$name" ] && break; sleep .05; done
 fi
