@@ -2545,7 +2545,12 @@ _MD_VIEW_CSS = """
   /* A long URL wraps rather than running out of the column. anywhere, not
      break-word: a URL has no spaces to break at, so break-word never fires
      and the line simply overflowed the measure. */
-  main, main p, main li, main td, main th { overflow-wrap: anywhere; }
+  main, main p, main li { overflow-wrap: anywhere; }
+  /* Not in a table cell, though: there anywhere lets the table shrink a
+     column below its longest word, and a header came out "stag" over "e".
+     So does break-word, in Chrome's table layout. A cell wraps at spaces
+     only; a string with none scrolls in the table's own box. */
+  main td, main th { overflow-wrap: normal; }
   main a .u { color: var(--c-muted); font-size: .84em; overflow-wrap: anywhere; }
   /* A link whose address is on the hover rather than on the page says so
      with a dotted underline; the button beside it copies the address. */
@@ -3761,8 +3766,7 @@ __INTER__
      tables that genuinely need one. Numbers are unaffected -- there is
      nothing in "1.0821e-6" to wrap at. */
   th, td { border: 1px solid var(--c-line-strong); padding: .3rem .55rem;
-           text-align: left; vertical-align: top;
-           overflow-wrap: break-word; }
+           text-align: left; vertical-align: top; }
   th { background: rgba(255,255,255,.06); font-weight: 600;
        position: sticky; top: 0; }
   tbody tr:nth-child(2n) { background: rgba(255,255,255,.025); }
@@ -7365,11 +7369,12 @@ __INTER__
       margin: .6rem 0 .3rem; font-size: 1.02em; font-weight: 700; }
   .e .md ul, .e .md ol { padding-left: 1.2rem; }
   .e .md li { margin: .15rem 0; }
-  .e .md table { border-collapse: collapse; margin: .5rem 0; font-size: .93em;
-                 display: block; max-width: 100%; overflow-x: auto; }
+  /* Centred in the column, as the document viewer has them: only as wide as
+     it needs, up to the column, and scrolling in its own box beyond that. */
+  .e .md table { border-collapse: collapse; margin: .5rem auto; font-size: .93em;
+                 display: block; width: max-content; max-width: 100%; overflow-x: auto; }
   .e .md th, .e .md td { border: 1px solid var(--c-line-strong); padding: .3rem .55rem;
-                         text-align: left; vertical-align: top;
-                         overflow-wrap: break-word; }
+                         text-align: left; vertical-align: top; }
   .e .md th { background: rgba(255,255,255,.06); font-weight: 600; }
   .e .md code { background: rgba(255,255,255,.08); border-radius: 4px;
                 padding: .05rem .3rem; font: .855em/1.4 var(--c-mono); }
@@ -7401,7 +7406,10 @@ __INTER__
   .noks { border-color: var(--c-clay) !important; opacity: .85; }
   .e .md a { color: var(--c-accent); }
   .e .md a.fileref::after { content: " \\2197"; font-size: .85em; opacity: .7; }
-  .e .md, .e .md p, .e .md li, .e .md td { overflow-wrap: anywhere; }
+  /* Not in a cell, as in the document viewer: there it let a table split a
+     column's words a letter at a time. */
+  .e .md, .e .md p, .e .md li { overflow-wrap: anywhere; }
+  .e .md td, .e .md th { overflow-wrap: normal; }
   .e .md a .u { color: var(--c-muted); font-size: .84em; overflow-wrap: anywhere; }
   /* Where codex cut the thread. Its own "Conversation recap" is drawn by
      the TUI and never written to the rollout, so the words cannot be shown
@@ -7886,6 +7894,13 @@ __INTER__
   #cog { display: inline-flex; align-items: center; justify-content: center;
          padding: .3rem .45rem; }
   #cog.on { color: var(--c-accent); border-color: var(--c-accent); }
+  #modes:not(.gone) { display: flex; gap: .3rem; flex: none; }
+  #modes button { padding: .3rem .4rem; line-height: 0; }
+  #modes svg { display: block; }
+  #modes button.on { color: var(--c-accent); border-color: var(--c-accent); }
+  /* Narrower than the reader column all three widths are the same, and the
+     buttons would only push the bar onto another line. */
+  @media (max-width: 48rem) { #modes { display: none !important; } }
   #opts { display: inline-flex; flex-wrap: wrap; align-items: center; gap: .3rem .8rem; }
   #askbar { margin-bottom: .4rem; font-size: .8rem; }
   #askstate { color: var(--c-muted); }
@@ -8025,7 +8040,10 @@ __INTER__
      Assistant text sits on the page's own black. "detailed" restores the
      transcript chrome. */
   #hist:not(.detailed) .e > summary { display: none; }
-  #hist:not(.detailed) .e { border: 0; border-radius: 0; margin: 0; }
+  /* Auto at the sides, not 0: this outranks the column rule above, and a
+     plain 0 took its centring away, so answers sat at the window's left
+     edge while the messages and the box stayed in the middle. */
+  #hist:not(.detailed) .e { border: 0; border-radius: 0; margin: 0 auto; }
   #hist:not(.detailed) .e .md { padding: .1rem .6rem .5rem; }
   #hist:not(.detailed) .e pre { padding: .5rem .7rem;
       /* Prose, not console: the monospace grid is for the terminal, and
@@ -8040,7 +8058,9 @@ __INTER__
      box moves. */
   /* Clear air on both sides: in a wall of assistant prose the bubble has
      to announce itself as the moment someone spoke. */
-  #hist:not(.detailed) .user { background: none; margin: 1.45rem 0; }
+  /* auto at the sides, as for the answers: 0 took the column's centring
+     away, and the bubble, right-aligned inside, sat at the window's left. */
+  #hist:not(.detailed) .user { background: none; margin: 1.45rem auto; }
   #hist:not(.detailed) .user .md,
   #hist:not(.detailed) .user pre { background: var(--c-raised);
       color: var(--c-text); border-radius: 16px; padding: .5rem .85rem;
@@ -8067,11 +8087,12 @@ __INTER__
       margin: .6rem 0 .3rem; font-size: 1.02em; font-weight: 700; }
   .e .md ul, .e .md ol { padding-left: 1.2rem; }
   .e .md li { margin: .15rem 0; }
-  .e .md table { border-collapse: collapse; margin: .5rem 0; font-size: .93em;
-                 display: block; max-width: 100%; overflow-x: auto; }
+  /* Centred in the column, as the document viewer has them: only as wide as
+     it needs, up to the column, and scrolling in its own box beyond that. */
+  .e .md table { border-collapse: collapse; margin: .5rem auto; font-size: .93em;
+                 display: block; width: max-content; max-width: 100%; overflow-x: auto; }
   .e .md th, .e .md td { border: 1px solid var(--c-line-strong); padding: .3rem .55rem;
-                         text-align: left; vertical-align: top;
-                         overflow-wrap: break-word; }
+                         text-align: left; vertical-align: top; }
   .e .md th { background: rgba(255,255,255,.06); font-weight: 600; }
   .e .md code { background: rgba(255,255,255,.08); border-radius: 4px;
                 padding: .05rem .3rem; font: .855em/1.4 var(--c-mono); }
@@ -8103,7 +8124,10 @@ __INTER__
   .noks { border-color: var(--c-clay) !important; opacity: .85; }
   .e .md a { color: var(--c-accent); }
   .e .md a.fileref::after { content: " \\2197"; font-size: .85em; opacity: .7; }
-  .e .md, .e .md p, .e .md li, .e .md td { overflow-wrap: anywhere; }
+  /* Not in a cell, as in the document viewer: there it let a table split a
+     column's words a letter at a time. */
+  .e .md, .e .md p, .e .md li { overflow-wrap: anywhere; }
+  .e .md td, .e .md th { overflow-wrap: normal; }
   .e .md a .u { color: var(--c-muted); font-size: .84em; overflow-wrap: anywhere; }
   /* Where codex cut the thread. Its own "Conversation recap" is drawn by
      the TUI and never written to the rollout, so the words cannot be shown
@@ -8179,6 +8203,34 @@ __INTER__
   </select>
   <span class="r" id="meta">…</span>
   <span id="link" class="gone">reconnecting…</span>
+  <!-- The document viewer's three widths, the same icons and the same
+       stored choice, so the two read alike. -->
+  <span id="modes" class="gone">
+    <button id="readbtn" type="button" title="reader — one column, set for reading">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+        <rect x="3.2" y="1.6" width="9.6" height="12.8" rx="1.4"
+              fill="none" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M5.4 5h5.2M5.4 7.6h5.2M5.4 10.2h3.4" stroke="currentColor"
+              stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <button id="midbtn" type="button" title="wider column — a page and a half">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true">
+        <rect x="1.4" y="2.8" width="13.2" height="10.4" rx="1.4"
+              fill="none" stroke="currentColor" stroke-width="1.2"/>
+        <path d="M3.6 6h8.8M3.6 8.5h8.8M3.6 11h6" stroke="currentColor"
+              stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <button id="widebtn" type="button" title="full width — use the whole window">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"
+           fill="none" stroke="currentColor" stroke-width="1.3"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6.2 2.2H2.2v4M9.8 2.2h4v4M6.2 13.8H2.2v-4M9.8 13.8h4v-4"/>
+        <path d="M5.6 5.6 2.6 2.6M10.4 5.6l3-3M5.6 10.4l-3 3M10.4 10.4l3 3"/>
+      </svg>
+    </button>
+  </span>
 </header>
 <div id="slots"></div>
 <div id="pull"><span>start of scrollback</span></div>
@@ -8490,6 +8542,7 @@ function syncControls() {
   // The options live behind the cog, and both belong to the web view only.
   const cog = document.getElementById("cog");
   cog.classList.toggle("gone", onTerm);
+  document.getElementById("modes").classList.toggle("gone", onTerm);
   document.getElementById("opts").classList.toggle(
     "gone", onTerm || cog.getAttribute("aria-expanded") !== "true");
 }
@@ -8780,18 +8833,30 @@ function findLinks(t, y, cb) {
 }
 
 // --- reading width -----------------------------------------------------
-// Set in the document viewer, which has the three buttons, and honoured here
-// so a transcript reads the way documents do. There is nothing to press in
-// this bar: a line that runs the whole of a wide window is as hard to follow
+// The document viewer's three widths, with its buttons and its stored
+// choice: a line that runs the whole of a wide window is as hard to follow
 // in a conversation as in a document, and one choice covers both. Only the
-// transcript moves; the terminal is a grid and takes whatever it is given.
+// transcript moves; the terminal is a grid and takes whatever it is given,
+// so the buttons are on the web tab only.
+const widthBtn = { read: document.getElementById("readbtn"),
+                   mid: document.getElementById("midbtn"),
+                   wide: document.getElementById("widebtn") };
 let width = "read";
 try {
   const w = localStorage.getItem("roost.width");
   if (w === "read" || w === "mid" || w === "wide") width = w;
 } catch (e) {}
-document.body.classList.toggle("mid", width === "mid");
-document.body.classList.toggle("wide", width === "wide");
+function paintWidth() {
+  document.body.classList.toggle("mid", width === "mid");
+  document.body.classList.toggle("wide", width === "wide");
+  for (const k in widthBtn) widthBtn[k].classList.toggle("on", k === width);
+}
+paintWidth();
+for (const k in widthBtn) widthBtn[k].onclick = () => {
+  width = k;
+  try { localStorage.setItem("roost.width", k); } catch (e) {}
+  paintWidth();
+};
 
 // --- staying connected -------------------------------------------------
 // The terminal's websocket is relayed through roost, so every roost restart
